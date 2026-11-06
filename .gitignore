@@ -1,0 +1,9 @@
+# Herdr runtime generated type definitions & project configs
+gpui-kit.d.ts
+herdr.d.ts
+jsconfig.json
+*.error
+
+# macOS & editor artifacts
+.DS_Store
+node_modules/
