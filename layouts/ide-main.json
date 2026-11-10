@@ -29,7 +29,7 @@
               "id": "spaces",
               "type": "block",
               "content": {
-                "mod": "spaces"
+                "mod": "ide-spaces"
               },
               "size": {
                 "weight": 1
@@ -40,7 +40,7 @@
               "id": "agents",
               "type": "block",
               "content": {
-                "mod": "agents"
+                "mod": "ide-agents"
               },
               "size": {
                 "weight": 1
@@ -146,10 +146,10 @@
                 }
               ],
               "size": {
-                "px": 368
+                "px": 680
               },
-              "min": 280,
-              "max": 1100,
+              "min": 320,
+              "max": 1200,
               "hidden": true
             }
           ],

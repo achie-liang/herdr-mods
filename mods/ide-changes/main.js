@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { exec, readTextFile, watchFolder, theme, settings } from "herdr";
+import { exec, readTextFile, watchFolder, theme, settings, nextCommand } from "herdr";
 import {
   location,
   locationKey,
@@ -22,7 +22,31 @@ export default class IdeChanges extends View {
     this.rows = [];
     this.diffWidth = 0;
     this.message = "";
+    this.filterQuery = "";
+    this.filterFocused = false;
     this.handle = cx.focus_handle();
+
+    this.filterInput = InputState.new({ placeholder: "Filter changed files… (⌘F)" });
+    this.filterInput.on("change", (_e, cx) => {
+      this.filterQuery = this.filterInput.value();
+      this.syncFilteredSelection(cx);
+      cx.notify();
+    });
+    this.filterInput.on("submit", (_e, cx) => {
+      const matched = this.filteredFiles();
+      if (matched.length > 0 && this.open !== matched[0].id) {
+        this.pick(matched[0].id, cx);
+      }
+    });
+    this.filterInput.on("focus", (_e, cx) => {
+      this.filterFocused = true;
+      cx.notify();
+    });
+    this.filterInput.on("blur", (_e, cx) => {
+      this.filterFocused = false;
+      cx.notify();
+    });
+
     this.input = InputState.new({ placeholder: "Commit message" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -38,8 +62,66 @@ export default class IdeChanges extends View {
       this.typing = false;
       cx.notify();
     });
+
+    cx.spawn(async cx => {
+      for (;;) {
+        const cmd = await nextCommand();
+        if (!cmd) continue;
+        if (cmd === "focus") {
+          this.handle.focus();
+        } else if (cmd === "find") {
+          this.filterInput.focus();
+        }
+        cx.notify();
+      }
+    });
+
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
+  }
+
+  matchesFilter(file) {
+    const q = (this.filterQuery || "").trim().toLowerCase();
+    if (!q) return true;
+    const target = `${file.repoRel ? file.repoRel + "/" : ""}${file.path}`.toLowerCase();
+    const tokens = q.split(/\s+/).filter(Boolean);
+    return tokens.every(tok => target.includes(tok));
+  }
+
+  filteredFiles() {
+    if (!this.filterQuery.trim()) return this.files;
+    return this.files.filter(f => this.matchesFilter(f));
+  }
+
+  syncFilteredSelection(cx) {
+    if (!this.filterQuery.trim()) return;
+    const matched = this.filteredFiles();
+    if (matched.length > 0 && !matched.some(f => f.id === this.open)) {
+      const next = matched[0];
+      this.activeRepoRoot = next.repoRoot;
+      this.activeRepoRel = next.repoRel || "";
+      this.open = next.id;
+      this.setLines([]);
+      this.note = null;
+      this.closed = false;
+      const context = this.context;
+      cx.spawn(async cx => {
+        try {
+          await this.load(next.id, context);
+        } catch (e) {
+          if (locationKey() === context && this.open === next.id) {
+            this.note = `Cannot preview this diff (too large or unreadable): ${e}`;
+          }
+        }
+        cx.notify();
+      });
+    }
+  }
+
+  clearFilter(cx) {
+    this.filterQuery = "";
+    this.filterInput.set_value("");
+    cx.notify();
   }
 
   watch(root, cx) {
@@ -73,6 +155,8 @@ export default class IdeChanges extends View {
       this.setLines([]);
       this.message = "";
       this.input.set_value("");
+      this.filterQuery = "";
+      this.filterInput.set_value("");
       this.error = null;
       this.note = null;
       this.watched = null;
@@ -222,7 +306,7 @@ export default class IdeChanges extends View {
 
   setLines(lines) {
     this.rows = diffRows(lines);
-    this.diffWidth = Math.max(300, ...lines.map(line => line.length * 7 + 50));
+    this.diffWidth = Math.max(300, ...lines.map(line => line.length * 7 + 64));
   }
 
   pick(fileId, cx) {
@@ -311,7 +395,8 @@ export default class IdeChanges extends View {
       .w_full()
       .h(20)
       .flex_none()
-      .gap(10)
+      .gap(6)
+      .items_center()
       .when(kind === "+", e => e.bg(t.ansi2 + "18"))
       .when(kind === "-", e => e.bg(t.ansi1 + "18"))
       .child(
@@ -319,8 +404,16 @@ export default class IdeChanges extends View {
           .w(30)
           .flex_none()
           .text_right()
-          .text_color(t.dim)
+          .text_color(kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : t.dim)
           .child(number === undefined ? "" : String(number)),
+      )
+      .child(
+        div()
+          .w(12)
+          .flex_none()
+          .text_center()
+          .text_color(kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : t.dim)
+          .child(kind === "+" || kind === "-" ? kind : " "),
       )
       .child(div().flex_1().min_w(0).truncate().child(text));
   }
@@ -373,14 +466,17 @@ export default class IdeChanges extends View {
   }
 
   renderListItems(t) {
+    const hasFilter = Boolean(this.filterQuery.trim());
     if (!this.multiRepo) {
-      return this.files.map(f => this.renderFileRow(f, t, false));
+      return this.filteredFiles().map(f => this.renderFileRow(f, t, false));
     }
     const items = [];
     for (const g of this.groups) {
-      const folded = this.foldedGroups.has(g.repoRel);
-      const gAdd = g.files.reduce((n, f) => n + f.add, 0);
-      const gDel = g.files.reduce((n, f) => n + f.del, 0);
+      const groupFiles = hasFilter ? g.files.filter(f => this.matchesFilter(f)) : g.files;
+      if (hasFilter && groupFiles.length === 0) continue;
+      const folded = !hasFilter && this.foldedGroups.has(g.repoRel);
+      const gAdd = groupFiles.reduce((n, f) => n + f.add, 0);
+      const gDel = groupFiles.reduce((n, f) => n + f.del, 0);
       const isTarget = this.activeRepoRoot === g.repoRoot;
       const displayBranch =
         g.branch && g.branch.length > 24 ? `${g.branch.slice(0, 23)}…` : g.branch;
@@ -428,7 +524,7 @@ export default class IdeChanges extends View {
               .border_color(t.border)
               .text_size(10)
               .text_color(t.muted)
-              .child(`${g.files.length}`),
+              .child(hasFilter ? `${groupFiles.length}/${g.files.length}` : `${g.files.length}`),
           )
           .child(div().flex_1())
           .when(gAdd > 0, e => e.child(div().text_size(11).text_color(t.ansi2).child(`+${gAdd}`)))
@@ -436,7 +532,7 @@ export default class IdeChanges extends View {
       );
 
       if (!folded) {
-        for (const f of g.files) {
+        for (const f of groupFiles) {
           items.push(this.renderFileRow(f, t, true));
         }
       }
@@ -447,6 +543,8 @@ export default class IdeChanges extends View {
   render(cx) {
     if (locationKey() !== this.context) this.refresh(cx);
     const t = theme();
+    const hasFilter = Boolean(this.filterQuery.trim());
+    const matchedFiles = this.filteredFiles();
     const add = this.files.reduce((n, f) => n + f.add, 0);
     const del = this.files.reduce((n, f) => n + f.del, 0);
     const targetRoot = this.activeRepoRoot || (!this.multiRepo ? this.root : null);
@@ -467,11 +565,32 @@ export default class IdeChanges extends View {
       .text_size(13)
       .track_focus(this.handle)
       .on_key_down((e, cx) => {
-        if (e.key === "escape" && this.typing) {
-          this.typing = false;
-          this.handle.focus();
+        const k = (e.key || "").toLowerCase();
+        const cmdOrCtrl = Boolean(e.modifiers?.platform || e.modifiers?.control);
+        if (cmdOrCtrl && k === "f") {
           cx.stop_propagation();
+          this.filterInput.focus();
           cx.notify();
+          return;
+        }
+        if (k === "escape") {
+          if (this.filterFocused) {
+            cx.stop_propagation();
+            if (this.filterQuery) {
+              this.clearFilter(cx);
+            } else {
+              this.filterFocused = false;
+              this.handle.focus();
+              cx.notify();
+            }
+            return;
+          }
+          if (this.typing) {
+            this.typing = false;
+            this.handle.focus();
+            cx.stop_propagation();
+            cx.notify();
+          }
         }
       })
       .child(
@@ -493,7 +612,11 @@ export default class IdeChanges extends View {
               .border_color(t.border)
               .text_size(10)
               .text_color(t.muted)
-              .child(`${this.files.length} files`),
+              .child(
+                hasFilter
+                  ? `${matchedFiles.length} / ${this.files.length} files`
+                  : `${this.files.length} files`,
+              ),
           )
           .when(this.multiRepo && this.groups.length > 0, el =>
             el.child(
@@ -510,7 +633,86 @@ export default class IdeChanges extends View {
           )
           .child(div().flex_1())
           .child(div().text_size(11).text_color(t.ansi2).child(`+${add}`))
-          .child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)),
+          .child(div().text_size(11).text_color(t.ansi1).child(`−${del}`))
+          .child(
+            div()
+              .id("changes-search-focus")
+              .size(22)
+              .flex_none()
+              .flex()
+              .items_center()
+              .justify_center()
+              .rounded(4)
+              .cursor_pointer()
+              .when(this.filterFocused || hasFilter, el => el.bg(t.selected))
+              .text_color(this.filterFocused || hasFilter ? t.accent : t.muted)
+              .hover(s => s.bg(t.hover).text_color(t.foreground))
+              .tooltip("Filter Changed Files (⌘F)")
+              .on_click((_e, cx) => {
+                this.filterInput.focus();
+                cx.notify();
+              })
+              .child(svg("mods/ide-changes/search.svg").size(13)),
+          ),
+      )
+      .when(this.files.length > 0 || hasFilter || this.filterFocused, el =>
+        el.child(
+          h_flex()
+            .flex_none()
+            .px(8)
+            .py(6)
+            .border_b(1)
+            .border_color(t.border)
+            .child(
+              h_flex()
+                .id("changes-filter-box")
+                .w_full()
+                .h(26)
+                .px(8)
+                .gap(6)
+                .items_center()
+                .rounded(6)
+                .bg(t.raised)
+                .border_1()
+                .border_color(this.filterFocused ? t.accent : t.border)
+                .cursor_text()
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .child(
+                  svg("mods/ide-changes/search.svg")
+                    .size(12.5)
+                    .flex_none()
+                    .text_color(this.filterFocused || hasFilter ? t.accent : t.dim),
+                )
+                .child(
+                  Input.new(this.filterInput)
+                    .flex_1()
+                    .h_full()
+                    .text_size(12)
+                    .text_color(t.foreground),
+                )
+                .when(hasFilter, box =>
+                  box.child(
+                    div()
+                      .id("changes-filter-clear")
+                      .size(18)
+                      .flex_none()
+                      .flex()
+                      .items_center()
+                      .justify_center()
+                      .rounded(4)
+                      .cursor_pointer()
+                      .text_color(t.muted)
+                      .hover(s => s.bg(t.hover).text_color(t.foreground))
+                      .tooltip("Clear Filter (Esc)")
+                      .on_click((e, cx) => {
+                        cx.stop_propagation();
+                        this.clearFilter(cx);
+                      })
+                      .child(svg("mods/ide-changes/close.svg").size(11.5)),
+                  ),
+                ),
+            ),
+        ),
       )
       .child(
         v_flex()
@@ -535,6 +737,15 @@ export default class IdeChanges extends View {
                         ? "No uncommitted changes"
                         : "No folder"),
                 ),
+            ),
+          )
+          .when(this.files.length > 0 && !listItems.length, e =>
+            e.child(
+              div()
+                .p(8)
+                .text_size(12)
+                .text_color(t.dim)
+                .child(`No changed files matching "${this.filterQuery}"`),
             ),
           ),
       )

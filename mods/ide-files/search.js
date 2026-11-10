@@ -1,6 +1,6 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Input } from "gpui-base";
-import { exec, readTextFile, writeTextFile, notify } from "herdr";
+import { exec, readTextFile, writeTextFile, notify, run } from "herdr";
 import { getFileIcon, ICON_PREFIX } from "./icons.js";
 import {
   SEARCH_SIDEBAR_WIDTH,
@@ -60,13 +60,12 @@ exit 127
 
 export const searchMethods = {
   openWorkspaceSearch(cx) {
-    if (!this.searchMode) {
-      if (this.panelSize?.width && this.panelSize.width <= 520) {
-        this.savedExplorerWidth = this.panelSize.width;
-      }
-      this.searchMode = true;
-      this.syncPanelWidth();
-    }
+    try {
+      run("layout.select", { stack: "panel-body", child: "files" });
+      run("layout.show", { id: "panel" });
+    } catch {}
+    this.rightSidebarCollapsed = false;
+    this.searchMode = true;
     this.wsSearchInput.focus();
     if (this.wsSearchInput.value().trim()) {
       this.executeWorkspaceSearch(cx);
@@ -76,7 +75,6 @@ export const searchMethods = {
 
   closeWorkspaceSearch(cx) {
     this.searchMode = false;
-    this.syncPanelWidth();
     this.handle.focus();
     cx.notify();
   },
@@ -555,7 +553,8 @@ export const searchMethods = {
       .flex_none()
       .h_full()
       .min_h(0)
-      .when(Boolean(this.file), el => el.border_l(1).border_color(t.border))
+      .border_l(1)
+      .border_color(t.border)
       .children([
         // Search Sidebar Header Bar
         h_flex()
@@ -567,25 +566,23 @@ export const searchMethods = {
           .items_center()
           .border_b(1)
           .border_color(t.border)
-          .when(!this.file, hdr =>
-            hdr.child(
-              div()
-                .id("ws-back-explorer")
-                .w(18)
-                .h(20)
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .mr(4)
-                .rounded(4)
-                .cursor_pointer()
-                .text_color(t.muted)
-                .hover(s => s.bg(t.hover).text_color(t.foreground))
-                .tooltip("Back to Explorer")
-                .on_click((_e, cx) => this.closeWorkspaceSearch(cx))
-                .child("←"),
-            ),
+          .child(
+            div()
+              .id("ws-back-explorer")
+              .w(18)
+              .h(20)
+              .flex_none()
+              .flex()
+              .items_center()
+              .justify_center()
+              .mr(4)
+              .rounded(4)
+              .cursor_pointer()
+              .text_color(t.muted)
+              .hover(s => s.bg(t.hover).text_color(t.foreground))
+              .tooltip("Back to File Tree")
+              .on_click((_e, cx) => this.closeWorkspaceSearch(cx))
+              .child("←"),
           )
           .child(div().flex_none().mr(6).text_size(11.5).font_bold().text_color(t.muted).child("SEARCH"))
           .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(rootName))
@@ -608,16 +605,6 @@ export const searchMethods = {
                   (_e, cx) => {
                     this.collapseAll(cx);
                   },
-                ),
-              )
-              .child(
-                this.headerIconButton(
-                  t,
-                  "ws-hdr-close",
-                  "search",
-                  "Close Search Files",
-                  (_e, cx) => this.closeWorkspaceSearch(cx),
-                  true,
                 ),
               ),
           ),

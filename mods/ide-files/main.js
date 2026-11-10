@@ -1,7 +1,7 @@
-// IDE-style file explorer with Seti file icons, git repo branch subtitles,
-// git file/folder status decorations, fixed-width workspace Search Files sidebar
-// (with Replace & include/exclude globs), in-file Find text search,
-// drag-to-chat, and right-click context menu.
+// IDE-style file explorer with Cursor-like split layout:
+// - Persistent left pane: File Viewer (with Markdown Preview/Source, Lines/Syntax, In-File Find)
+//   or Quick Open ("Files, Folders..." search + Recents) when no file is open.
+// - Collapsible right sidebar: switches between File Tree (Explorer) and Workspace Search & Replace.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState } from "gpui-base";
 import {
@@ -9,7 +9,6 @@ import {
   exec,
   watchFolder,
   theme,
-  run,
   notify,
   nextCommand,
 } from "herdr";
@@ -17,8 +16,7 @@ import { getFileIcon, ICON_PREFIX } from "./icons.js";
 import {
   PER_FOLDER,
   TOTAL,
-  SEARCH_SIDEBAR_WIDTH,
-  SPLIT_PREVIEW_WIDTH,
+  RIGHT_SIDEBAR_WIDTH,
   GIT_COLOR,
   GIT_DOT_COLOR,
   STATUS_PRIORITY,
@@ -44,7 +42,11 @@ export default class IdeFiles extends View {
           "{}",
       );
       for (const [k, v] of Object.entries(raw)) {
-        this.saved.set(k, { folders: new Set(v.folders || []), file: null });
+        this.saved.set(k, {
+          folders: new Set(v.folders || []),
+          recents: Array.isArray(v.recents) ? v.recents : [],
+          file: null,
+        });
       }
     } catch {}
     this.entries = new Map();
@@ -56,6 +58,8 @@ export default class IdeFiles extends View {
     this.branches = {};
     this.repos = new Set();
     this.lines = [];
+    this.rawText = "";
+    this.mdPreview = true;
     this.lineScroll = 0;
     this.linesViewHeight = 520;
     this.scrollbarDrag = false;
@@ -67,9 +71,48 @@ export default class IdeFiles extends View {
     this.lastTarget = null;
     this.pendingMenu = null;
     this.contextMenu = null;
-    this.hoveredHeader = false;
-    this.panelSize = { width: 368, height: 600 };
-    this.savedExplorerWidth = 368;
+    this.panelSize = { width: 680, height: 600 };
+
+    // Navigation history & Recents & Quick Open state
+    this.history = [null];
+    this.historyIdx = 0;
+    this.recents = [];
+    this.wsIndex = [];
+    this.wsIndexRoot = null;
+    this.wsIndexLoading = false;
+    this.quickQuery = "";
+    this.quickFocused = false;
+    this.quickInput = InputState.new({ placeholder: "Files, Folders..." });
+    this.quickInput.on("change", (_e, cx) => {
+      this.quickQuery = this.quickInput.value();
+      cx.notify();
+    });
+    this.quickInput.on("submit", (_e, cx) => {
+      const matches = this.filteredQuickEntries();
+      if (matches.length > 0) {
+        const first = matches[0];
+        if (first.isDir) {
+          this.rightSidebarCollapsed = false;
+          this.searchMode = false;
+          this.revealFileInTree(`${first.path}/_`, cx);
+        } else {
+          this.show(first.path, cx);
+        }
+        cx.notify();
+      }
+    });
+    this.quickInput.on("focus", (_e, cx) => {
+      this.quickFocused = true;
+      cx.notify();
+    });
+    this.quickInput.on("blur", (_e, cx) => {
+      this.quickFocused = false;
+      cx.notify();
+    });
+
+    // Right sidebar state (Explorer vs Search, collapsible)
+    this.rightSidebarCollapsed = false;
+    this.searchMode = false;
 
     // In-file Find state
     this.findOpen = false;
@@ -102,7 +145,6 @@ export default class IdeFiles extends View {
     });
 
     // Workspace Search Files state
-    this.searchMode = false;
     this.wsShowDetails = true;
     this.wsQuery = "";
     this.wsReplace = "";
@@ -207,7 +249,7 @@ export default class IdeFiles extends View {
           this.handle.focus();
         } else if (cmd === "find") {
           if (this.file) this.openFileFind(cx);
-          else this.openWorkspaceSearch(cx);
+          else this.quickInput.focus();
         } else if (cmd === "search_files") {
           this.openWorkspaceSearch(cx);
         } else if (cmd === "find_next") {
@@ -223,28 +265,22 @@ export default class IdeFiles extends View {
     cx.timer.every(10000, cx => this.refresh(cx));
   }
 
-  syncPanelWidth() {
-    try {
-      if (this.searchMode) {
-        if (this.file) {
-          run("layout.resize", { id: "panel", px: SPLIT_PREVIEW_WIDTH });
-        } else {
-          run("layout.resize", { id: "panel", px: SEARCH_SIDEBAR_WIDTH });
-        }
-      } else {
-        const restoreW = Math.max(300, Math.min(600, this.savedExplorerWidth || 368));
-        run("layout.resize", { id: "panel", px: restoreW });
-      }
-    } catch {}
-  }
-
   persistFolders() {
     if (!this.context?.key) return;
-    this.saved.set(this.context.key, { folders: new Set(this.folders), file: this.file });
+    this.saved.set(this.context.key, {
+      folders: new Set(this.folders),
+      recents: [...(this.recents || [])],
+      file: this.file,
+      history: [...(this.history || [null])],
+      historyIdx: this.historyIdx || 0,
+    });
     try {
       const obj = {};
       for (const [k, v] of this.saved.entries()) {
-        obj[k] = { folders: [...(v.folders || [])] };
+        obj[k] = {
+          folders: [...(v.folders || [])],
+          recents: [...(v.recents || [])],
+        };
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
     } catch {}
@@ -394,26 +430,41 @@ export default class IdeFiles extends View {
     const { cwd, on } = location();
     const next = locationKey();
     if (next !== this.context?.key) {
-      if (this.context)
-        this.saved.set(this.context.key, { folders: this.folders, file: this.file });
+      if (this.context) {
+        this.saved.set(this.context.key, {
+          folders: this.folders,
+          recents: this.recents || [],
+          file: this.file,
+          history: this.history || [null],
+          historyIdx: this.historyIdx || 0,
+        });
+      }
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on };
       this.root = cwd;
       this.on = on;
       this.entries = new Map();
       this.folders = new Set(saved?.folders);
+      this.recents = [...(saved?.recents || [])];
+      this.history = saved?.history?.length ? [...saved.history] : [null];
+      this.historyIdx = typeof saved?.historyIdx === "number" ? saved.historyIdx : 0;
       this.pending = new Set();
       this.marks = {};
       this.folderMarks = {};
       this.ignored = new Set();
       this.branches = {};
       this.repos = new Set();
-      this.show(null);
+      this.wsIndex = [];
+      this.wsIndexRoot = null;
+      this.wsIndexLoading = false;
+      this.quickQuery = "";
+      this.quickInput.set_value("");
+      this.show(null, null, { fromHistory: true });
       this.watched = null;
       this.error = null;
       this.limited = false;
       this.loading = false;
-      if (saved?.file) this.show(saved.file, cx);
+      if (saved?.file) this.show(saved.file, cx, { fromHistory: true });
       if (this.searchMode && this.wsQuery) this.executeWorkspaceSearch(cx);
     }
     if (!cwd || this.loading) return;
@@ -533,6 +584,7 @@ export default class IdeFiles extends View {
       const branch = entry.dir ? this.branches[absPath] : null;
       const ref = formatRef(path, entry.dir);
       const isDragged = this.drag?.path === path && this.drag?.moved;
+      const isActiveFile = !entry.dir && this.file === path;
       const fileIcon = !entry.dir ? getFileIcon(entry.name) : null;
 
       const labelColor = fileMark
@@ -558,14 +610,17 @@ export default class IdeFiles extends View {
       out.push(
         h_flex()
           .id(`file-${path}`)
-          .h(23)
+          .h(24)
           .flex_none()
+          .mx(4)
           .pl(6)
-          .pr(10)
+          .pr(8)
+          .rounded(5)
           .items_center()
           .cursor_pointer()
+          .when(isActiveFile, el => el.bg(t.selected))
           .when(isDragged, el => el.bg(t.selected).opacity(0.75))
-          .hover(s => s.bg(t.hover))
+          .when(!isActiveFile, el => el.hover(s => s.bg(t.hover)))
           .on_mouse_down("left", (e, cx) => {
             cx.stop_propagation();
             this.contextMenu = null;
@@ -661,6 +716,117 @@ export default class IdeFiles extends View {
     return out;
   }
 
+  renderExplorerSidebar(t) {
+    const rootName = this.root?.split(/[\\/]/).pop() || "files";
+    const rootBranch = this.root ? this.branches[this.root] : null;
+
+    return v_flex()
+      .id("files-explorer-sidebar")
+      .w(RIGHT_SIDEBAR_WIDTH)
+      .flex_none()
+      .h_full()
+      .min_h(0)
+      .border_l(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .id("files-header")
+          .h(30)
+          .flex_none()
+          .pl(10)
+          .pr(6)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .when(Boolean(rootBranch), hdr =>
+            hdr
+              .child(
+                div()
+                  .flex_none()
+                  .mr(6)
+                  .text_size(12)
+                  .text_color(t.muted)
+                  .child(rootName),
+              )
+              .child(renderGitBranchSubtitle(rootBranch, t)),
+          )
+          .when(!rootBranch, hdr =>
+            hdr.child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(12)
+                .text_color(t.muted)
+                .child(rootName),
+            ),
+          )
+          .child(
+            h_flex()
+              .flex_none()
+              .gap(2)
+              .items_center()
+              .child(
+                this.headerIconButton(
+                  t,
+                  "files-refresh",
+                  "refresh",
+                  "Refresh Explorer",
+                  (_e, cx) => {
+                    this.wsIndexRoot = null;
+                    this.refresh(cx);
+                  },
+                ),
+              )
+              .child(
+                this.headerIconButton(
+                  t,
+                  "files-collapse",
+                  "collapse-all",
+                  "Collapse Folders in Explorer",
+                  (_e, cx) => {
+                    this.collapseAll(cx);
+                  },
+                ),
+              ),
+          ),
+      )
+      .child(
+        v_flex()
+          .id("files-tree")
+          .flex_1()
+          .min_h(0)
+          .overflow_y_scrollbar()
+          .py(4)
+          .children(this.rows("", 0, [], t))
+          .when(Boolean(this.error) || !this.entries.get("")?.length, tree =>
+            tree.child(
+              div()
+                .p(8)
+                .text_size(12)
+                .text_color(t.dim)
+                .child(
+                  this.error ||
+                    (this.loading
+                      ? "Loading files…"
+                      : this.root
+                        ? "No files"
+                        : "No folder"),
+                ),
+            ),
+          )
+          .when(this.limited, tree =>
+            tree.child(
+              div()
+                .p(8)
+                .text_size(11)
+                .text_color(t.dim)
+                .child("File list limited to 500 entries per folder and 5,000 total"),
+            ),
+          ),
+      );
+  }
+
   renderOptionToggle(t, id, label, active, tooltip, onClick) {
     return div()
       .id(id)
@@ -691,7 +857,7 @@ export default class IdeFiles extends View {
     if (!m) return null;
     const menuW = 248;
     const menuH = m.items.length * 32 + 16;
-    const maxW = this.panelSize?.width || 368;
+    const maxW = this.panelSize?.width || 680;
     const maxH = this.panelSize?.height || 600;
     const left = Math.max(8, Math.min(m.x, maxW - menuW - 8));
     const top = Math.max(8, Math.min(m.y, maxH - menuH - 8));
@@ -790,8 +956,6 @@ export default class IdeFiles extends View {
     const activeRef = this.file
       ? formatRef(this.file, false, range ? range[0] : null, range ? range[1] : null)
       : null;
-    const rootName = (this.root?.split(/[\\/]/).pop() || "FILES").toUpperCase();
-    const rootBranch = this.root ? this.branches[this.root] : null;
 
     return v_flex()
       .id("files")
@@ -808,13 +972,18 @@ export default class IdeFiles extends View {
       .text_size(13)
       .on_size_change(size => {
         this.panelSize = size;
-        if (!this.searchMode && size.width > 0) {
-          this.savedExplorerWidth = size.width;
-        }
       })
       .on_key_down((e, cx) => {
         const k = (e.key || "").toLowerCase();
         const cmdOrCtrl = Boolean(e.modifiers?.platform || e.modifiers?.control);
+        if (cmdOrCtrl && k === "c" && this.file && !this.rawEditor) {
+          const selText = this.getSelectedText?.();
+          if (selText) {
+            cx.stop_propagation();
+            cx.write_to_clipboard(selText);
+            return;
+          }
+        }
         if (cmdOrCtrl && k === "f" && e.modifiers?.shift) {
           cx.stop_propagation();
           this.openWorkspaceSearch(cx);
@@ -823,7 +992,7 @@ export default class IdeFiles extends View {
         if (cmdOrCtrl && k === "f") {
           cx.stop_propagation();
           if (this.file) this.openFileFind(cx);
-          else this.openWorkspaceSearch(cx);
+          else this.quickInput.focus();
           return;
         }
         if ((cmdOrCtrl && k === "g") || k === "f3") {
@@ -843,6 +1012,18 @@ export default class IdeFiles extends View {
           if (this.file && this.findOpen) {
             cx.stop_propagation();
             this.closeFileFind(cx);
+            return;
+          }
+          if (!this.file && this.quickFocused) {
+            cx.stop_propagation();
+            if (this.quickQuery) {
+              this.quickQuery = "";
+              this.quickInput.set_value("");
+            } else {
+              this.quickFocused = false;
+              this.handle.focus();
+            }
+            cx.notify();
             return;
           }
           if (this.searchMode) {
@@ -912,150 +1093,21 @@ export default class IdeFiles extends View {
             .child(`Drag left or release to Add to Chat: ${this.drag?.ref ?? ""}`),
         ),
       )
-      // Mode 1: Search Files active -> fixed 304px Search sidebar (with optional File Preview on the left)
-      .when(this.searchMode, el =>
-        el.child(
-          h_flex()
-            .flex_1()
-            .min_h(0)
-            .w_full()
-            .when(Boolean(this.file), row =>
-              row.child(this.renderFilePreviewPane(t, range, activeRef)),
-            )
-            .child(this.renderWorkspaceSearchSidebar(t)),
-        ),
-      )
-      // Mode 2: Explorer Tree (when searchMode is false and no file is open)
-      .when(!this.searchMode && !this.file, el =>
-        el
-          .child(
-            h_flex()
-              .id("files-header")
-              .h(30)
-              .flex_none()
-              .pl(6)
-              .pr(8)
-              .items_center()
-              .border_b(1)
-              .border_color(t.border)
-              .child(
-                div()
-                  .w(16)
-                  .h_full()
-                  .flex_none()
-                  .flex()
-                  .items_center()
-                  .justify_center()
-                  .mr(4)
-                  .child(
-                    svg(`${ICON_PREFIX}/codicon-chevron-down.svg`)
-                      .size(13)
-                      .text_color(t.muted),
-                  ),
-              )
-              .when(Boolean(rootBranch), hdr =>
-                hdr
-                  .child(
-                    div()
-                      .flex_none()
-                      .mr(6)
-                      .text_size(11.5)
-                      .font_bold()
-                      .text_color(t.muted)
-                      .child(rootName),
-                  )
-                  .child(renderGitBranchSubtitle(rootBranch, t)),
-              )
-              .when(!rootBranch, hdr =>
-                hdr.child(
-                  div()
-                    .flex_1()
-                    .min_w(0)
-                    .truncate()
-                    .text_size(11.5)
-                    .font_bold()
-                    .text_color(t.muted)
-                    .child(rootName),
-                ),
-              )
-              .child(
-                h_flex()
-                  .flex_none()
-                  .gap(2)
-                  .items_center()
-                  .child(
-                    this.headerIconButton(
-                      t,
-                      "files-search-toggle",
-                      "search",
-                      "Search Files (⌘⇧F)",
-                      (_e, cx) => {
-                        this.openWorkspaceSearch(cx);
-                      },
-                    ),
-                  )
-                  .child(
-                    this.headerIconButton(
-                      t,
-                      "files-refresh",
-                      "refresh",
-                      "Refresh Explorer",
-                      (_e, cx) => {
-                        this.refresh(cx);
-                      },
-                    ),
-                  )
-                  .child(
-                    this.headerIconButton(
-                      t,
-                      "files-collapse",
-                      "collapse-all",
-                      "Collapse Folders in Explorer",
-                      (_e, cx) => {
-                        this.collapseAll(cx);
-                      },
-                    ),
-                  ),
-              ),
+      // Unified Top Bar (← → Breadcrumbs | Preview/Source/Find/+Chat | 🔍 [>|])
+      .child(this.renderUnifiedTopBar(t, range, activeRef))
+      // Main Split Body: Left persistent File Viewer / Quick Open Home + Right collapsible Tree / Search sidebar
+      .child(
+        h_flex()
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .child(this.renderFilePreviewPane(t, cx))
+          .when(!this.rightSidebarCollapsed && !this.searchMode, row =>
+            row.child(this.renderExplorerSidebar(t)),
           )
-          .child(
-            v_flex()
-              .id("files-tree")
-              .flex_1()
-              .min_h(0)
-              .overflow_y_scrollbar()
-              .py(4)
-              .children(this.rows("", 0, [], t))
-              .when(Boolean(this.error) || !this.entries.get("")?.length, tree =>
-                tree.child(
-                  div()
-                    .p(8)
-                    .text_size(12)
-                    .text_color(t.dim)
-                    .child(
-                      this.error ||
-                        (this.loading
-                          ? "Loading files…"
-                          : this.root
-                            ? "No files"
-                            : "No folder"),
-                    ),
-                ),
-              )
-              .when(this.limited, tree =>
-                tree.child(
-                  div()
-                    .p(8)
-                    .text_size(11)
-                    .text_color(t.dim)
-                    .child("File list limited to 500 entries per folder and 5,000 total"),
-                ),
-              ),
+          .when(!this.rightSidebarCollapsed && this.searchMode, row =>
+            row.child(this.renderWorkspaceSearchSidebar(t)),
           ),
-      )
-      // Mode 3: Single File Preview (when searchMode is false and a file is open)
-      .when(!this.searchMode && Boolean(this.file), el =>
-        el.child(this.renderFilePreviewPane(t, range, activeRef)),
       )
       .when(Boolean(this.contextMenu), el => el.child(this.renderContextMenuOverlay(t)));
   }

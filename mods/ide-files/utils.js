@@ -16,8 +16,15 @@ export const LANG = {
 export const PER_FOLDER = 500;
 export const TOTAL = 5000;
 export const LINE_H = 20;
-export const SEARCH_SIDEBAR_WIDTH = 304;
+export const RIGHT_SIDEBAR_WIDTH = 260;
+export const SEARCH_SIDEBAR_WIDTH = 260;
 export const SPLIT_PREVIEW_WIDTH = 720;
+
+export function isMarkdownFile(path) {
+  if (!path) return false;
+  const lower = path.toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".mdx") || lower.endsWith(".markdown");
+}
 
 // Git status colors
 export const GIT_COLOR = {
