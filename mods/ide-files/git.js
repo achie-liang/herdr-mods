@@ -110,6 +110,100 @@ export async function inspectGitRepo(repoDir, on) {
   return { repoDir, branch, fileMarks, folderMarks, ignored };
 }
 
+export async function discoverWorktreeFeatures(baseRoot, customDirs, on) {
+  if (!baseRoot) return { hasWorktreeDir: false, wtDirs: [], features: [] };
+  const candidates = [
+    ...(Array.isArray(customDirs) ? customDirs : []),
+    ".worktree",
+    "worktree",
+    ".worktrees",
+    "worktrees",
+  ].filter((v, i, a) => v && typeof v === "string" && a.indexOf(v) === i);
+
+  const quotedCandidates = candidates.map(c => `"${c.replace(/"/g, '\\"')}"`).join(" ");
+  const script = `
+cd "$1" 2>/dev/null || exit 0
+found_dirs=""
+# 1. Check .herdr.json if present for custom worktreeDirs
+if [ -f ".herdr.json" ] && command -v python3 >/dev/null 2>&1; then
+  extra=$(python3 -c '
+import json
+try:
+  d = json.load(open(".herdr.json"))
+  dirs = d.get("worktreeDirs") or d.get("worktree_dirs") or []
+  if isinstance(dirs, str): dirs = [dirs]
+  for x in dirs:
+    if isinstance(x, str) and x.strip(): print(x.strip())
+except Exception:
+  pass
+' 2>/dev/null)
+else
+  extra=""
+fi
+
+# 2. Auto-detect worktree container dirs from git worktree list of child repos
+auto_dirs=""
+for repo in ./*/; do
+  [ -e "\${repo}.git" ] || continue
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree $1/"*)
+        rel="\${line#worktree $1/}"
+        first="\${rel%%/*}"
+        rest="\${rel#*/}"
+        if [ -n "$first" ] && [ "$first" != "\${repo%/}" ] && [ "\${rest#*/}" != "$rest" ]; then
+          auto_dirs="$auto_dirs $first"
+        fi
+        ;;
+    esac
+  done <<EOF
+$(git -C "$repo" --no-optional-locks worktree list --porcelain 2>/dev/null)
+EOF
+  break
+done
+
+seen_dirs="|"
+for d in $extra ${quotedCandidates} $auto_dirs; do
+  [ -n "$d" ] || continue
+  case "$seen_dirs" in *"|$d|"*) continue ;; esac
+  seen_dirs="\${seen_dirs}\${d}|"
+  if [ -d "$d" ]; then
+    printf "D\\t%s\\0" "$d"
+    for f in "$d"/*; do
+      [ -d "$f" ] || continue
+      fname="\${f##*/}"
+      printf "F\\t%s\\t%s\\0" "$d" "$fname"
+    done
+  fi
+done
+`;
+  const r = await exec("sh", ["-c", script, "wt-discover", baseRoot], { on }).catch(() => null);
+  if (!r || r.code !== 0 || !r.stdout) {
+    return { hasWorktreeDir: false, wtDirs: [], features: [] };
+  }
+  const wtDirs = [];
+  const features = [];
+  for (const rec of r.stdout.split("\0")) {
+    if (!rec) continue;
+    const parts = rec.split("\t");
+    if (parts[0] === "D" && parts[1]) {
+      wtDirs.push(parts[1]);
+    } else if (parts[0] === "F" && parts[1] && parts[2]) {
+      features.push({
+        wtDir: parts[1],
+        name: parts[2],
+        relPath: `${parts[1]}/${parts[2]}`,
+      });
+    }
+  }
+  features.sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    hasWorktreeDir: wtDirs.length > 0,
+    wtDirs,
+    features,
+  };
+}
+
 export function renderGitBranchSubtitle(branch, t) {
   const display = branch.length > 30 ? `${branch.slice(0, 29)}…` : branch;
   return h_flex()

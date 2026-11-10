@@ -6,24 +6,34 @@ An IDE-grade file explorer, code viewer, and workspace search & replace panel fo
 
 ## What you see
 
-- **Explorer Header (30px):** Shows the current folder name in uppercase, a `git:(branch)` subtitle when at a Git root, and action buttons for Search Files (`⌘⇧F`), Refresh, and Collapse All.
-- **File Tree (23px rows):** Indented guide lines (`1px`), Seti colored file icons, folder chevrons, `git:(branch)` subtitles on nested sub-repositories, and Git status coloring (`#e2b061` amber for Modified `M`, `#63c29f` teal for Untracked/Added `U`/`A`, `#e06c75` coral for Deleted/Conflict `D`/`C`, `#b88746`/`#4fa384`/`#c25a62` status dots on parent folders, and dimmed text for `.gitignore`d items).
-- **Workspace Search Sidebar (304px fixed width, or 720px split with file preview):**
+- **Explorer Header (30px):**
+  - In standard workspaces, shows the current folder name and a `git:(branch)` subtitle when at a Git root.
+  - When a parallel worktree directory exists (`.worktree`, `worktree`, `.worktrees`, `worktrees`, or auto-detected via `git worktree list`), the header left area becomes an interactive **Feature Worktree Dropdown (`22px` height)** showing the active feature name (or workspace root with a feature count badge) and a floating menu (`max_h: 320px`) listing `Workspace Root (main)` and all parallel feature directories.
+  - Right-side icon buttons (`22×22px`) for Refresh and Collapse All.
+- **File Tree (24px rows):** Indented guide lines (`1px`), Seti colored file icons, folder chevrons, `git:(branch)` subtitles on nested sub-repositories, and Git status coloring (`#e2b061` amber for Modified `M`, `#63c29f` teal for Untracked/Added `U`/`A`, `#e06c75` coral for Deleted/Conflict `D`/`C`, `#b88746`/`#4fa384`/`#c25a62` status dots on parent folders, and dimmed text for `.gitignore`d items).
+- **Workspace Search Sidebar (260px width alongside file preview):**
   - Search input with `Aa` (case), `[ ]` (whole word), and `.*` (regex) toggles.
   - Collapsible Replace input with `AB` (preserve case) toggle and Replace All button, plus `Files to include` and `Files to exclude` glob inputs.
   - Grouped file match list with match count badges, inline diff preview of replacements, and per-file Replace / Dismiss hover buttons.
-- **Code Preview & In-File Find:**
-  - Header (34px) with Back button, file icon and path, `Find` toggle (`⌘F`), `+ Chat` / `+ Lx-Ly` button, and `Lines` / `Syntax` mode toggle.
-  - Virtualized line view (20px row height) with line numbers, scrollbar with amber match ticks, and an optional top Find bar (`34px`) with `x of y` match navigation.
+- **Unified Top Bar & Code Preview / Editor:**
+  - Top bar (`36px`) with Back/Forward navigation buttons, clickable path breadcrumbs, Markdown `Preview` / `Source` switch, an icon-only **Read-Only / Edit mode toggle** (`codicon-eye.svg` for Read-Only, `codicon-edit.svg` highlighted in accent for Edit mode), Search in Files (`⌘⇧F`), and Right Sidebar toggle.
+  - **Read-Only Mode:** Virtualized line viewer (`20px` row height) with line numbers, **always-on token syntax highlighting**, character-by-character selection (`#3568a899`), scrollbar with amber match ticks, and an optional top Find bar (`34px`, triggered via `⌘F`) with `x of y` match navigation.
+  - **Edit Mode:** Interactive `EditorState` syntax editor with debounced auto-save (`300ms`) back to disk via `writeTextFile`.
 
 ## How it behaves
 
-- **Navigation & Persistence:** Clicking a folder expands/collapses it and persists expanded folders per workspace in `localStorage` (`ide-files.saved`). Clicking a file opens its preview.
-- **In-File Find (`⌘F`):** Highlights all matches in `#e2b06140` and the active match in `#e2b06199`, scrolling the active line to center. `⌘G` / `⇧⌘G` (or Enter / Shift+Enter) steps through matches.
-- **Workspace Search (`⌘⇧F`):** Runs `rg --json` (falling back to `grep`) with 180ms debounce. Clicking a match opens the file alongside the 304px search sidebar (auto-resizing the `panel` block to `720px` via `layout.resize`) and jumps to the matched line.
+- **Navigation & Worktree Feature Switching:**
+  - Clicking a folder expands/collapses it and persists expanded folders per workspace in `localStorage` (`ide-files.saved`).
+  - Selecting a feature from the **Feature Worktree Dropdown** switches `this.root` to `<baseRoot>/<wtDir>/<feature>`, scoping the file tree, Git status/branches, Quick Open, and Workspace Search (`⌘⇧F`) to that feature's worktree directory.
+  - Worktree container directories are discovered via a 3-tier strategy: (1) default conventions (`.worktree`, `worktree`, `.worktrees`, `worktrees`), (2) zero-config auto-detection from `git worktree list --porcelain` on child repositories, and (3) optional explicit overrides in `.herdr.json` (`worktreeDirs`) or `shared("ide.worktree_dirs")`.
+- **Character-Level Selection & Copy (Read-Only Mode):**
+  - Dragging across code text selects character-by-character across one or multiple lines; double-clicking selects a word; triple-clicking or clicking/dragging the line-number gutter selects whole lines; `Shift`+click extends the selection.
+  - Pressing `⌘C` copies the exact selected text to the clipboard.
+- **In-File Find (`⌘F`):** Highlights all matches in `#e2b06140` and the active match in `#e2b06199` while preserving syntax colors on surrounding tokens, scrolling the active line to center. `⌘G` / `⇧⌘G` (or Enter / Shift+Enter) steps through matches.
+- **Workspace Search (`⌘⇧F`):** Runs `rg --json` (falling back to `grep`) with 180ms debounce. Clicking a match opens the file alongside the search sidebar and jumps to the matched line.
 - **Drag-to-Chat & Context Menu:**
-  - Dragging any file, folder, search match, or selected line range to the left (or >16px) pastes `@path/to/file` or `@path/to/file#L10-L20` directly into the focused terminal/agent pane.
-  - Right-clicking opens a context menu with `Add to Chat (@...)`, `Copy @...`, `Copy Relative Path`, `Copy Full Path`, or `Copy Selected Lines`.
+  - Dragging any file, folder, or search match to the left (or >16px) pastes `@path/to/file` or `@path/to/file#L10-L20` directly into the focused terminal/agent pane.
+  - Right-clicking opens a context menu with `Find in File (⌘F)`, `Add to Chat (@...)`, `Add Whole File`, `Copy @...`, `Copy Selected Text`, `Copy Relative Path`, or `Copy Full Path`.
 
 ## Built from
 

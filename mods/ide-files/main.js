@@ -11,6 +11,7 @@ import {
   theme,
   notify,
   nextCommand,
+  shared,
 } from "herdr";
 import { getFileIcon, ICON_PREFIX } from "./icons.js";
 import {
@@ -25,7 +26,12 @@ import {
   formatRef,
   pasteIntoTerminal,
 } from "./utils.js";
-import { listDirectory, inspectGitRepo, renderGitBranchSubtitle } from "./git.js";
+import {
+  listDirectory,
+  inspectGitRepo,
+  discoverWorktreeFeatures,
+  renderGitBranchSubtitle,
+} from "./git.js";
 import { searchMethods } from "./search.js";
 import { previewMethods } from "./preview.js";
 
@@ -45,10 +51,17 @@ export default class IdeFiles extends View {
         this.saved.set(k, {
           folders: new Set(v.folders || []),
           recents: Array.isArray(v.recents) ? v.recents : [],
+          selectedFeature: v.selectedFeature || null,
           file: null,
         });
       }
     } catch {}
+    this.baseRoot = null;
+    this.hasWorktreeDir = false;
+    this.wtDirs = [];
+    this.wtFeatures = [];
+    this.selectedFeature = null;
+    this.wtDropdownOpen = false;
     this.entries = new Map();
     this.folders = new Set();
     this.pending = new Set();
@@ -270,6 +283,7 @@ export default class IdeFiles extends View {
     this.saved.set(this.context.key, {
       folders: new Set(this.folders),
       recents: [...(this.recents || [])],
+      selectedFeature: this.selectedFeature || null,
       file: this.file,
       history: [...(this.history || [null])],
       historyIdx: this.historyIdx || 0,
@@ -280,10 +294,49 @@ export default class IdeFiles extends View {
         obj[k] = {
           folders: [...(v.folders || [])],
           recents: [...(v.recents || [])],
+          selectedFeature: v.selectedFeature || null,
         };
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
     } catch {}
+  }
+
+  selectFeature(relPath, cx) {
+    const nextFeature = relPath || null;
+    this.wtDropdownOpen = false;
+    if (this.selectedFeature === nextFeature) {
+      cx.notify();
+      return;
+    }
+    this.selectedFeature = nextFeature;
+    this.root =
+      this.selectedFeature && this.baseRoot
+        ? `${this.baseRoot}/${this.selectedFeature}`
+        : this.baseRoot;
+    if (this.context) {
+      this.context.cwd = this.root;
+    }
+    this.entries = new Map();
+    this.folders = new Set();
+    this.pending = new Set();
+    this.marks = {};
+    this.folderMarks = {};
+    this.ignored = new Set();
+    this.branches = {};
+    this.repos = new Set();
+    this.wsIndex = [];
+    this.wsIndexRoot = null;
+    this.wsIndexLoading = false;
+    this.history = [null];
+    this.historyIdx = 0;
+    this.show(null, null, { fromHistory: true });
+    this.persistFolders();
+    this.loading = false;
+    this.refresh(cx);
+    if (this.searchMode && this.wsQuery) {
+      this.executeWorkspaceSearch(cx);
+    }
+    cx.notify();
   }
 
   rememberTarget() {
@@ -329,7 +382,13 @@ export default class IdeFiles extends View {
   }
 
   current(context) {
-    return this.context === context && locationKey() === context.key;
+    const { cwd: rawCwd, on } = location();
+    let baseRoot = rawCwd;
+    if (rawCwd) {
+      const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
+      if (wtMatch && wtMatch[1]) baseRoot = wtMatch[1];
+    }
+    return this.context === context && JSON.stringify({ baseRoot, on }) === context.key;
   }
 
   async loadFolder(path, context) {
@@ -427,21 +486,34 @@ export default class IdeFiles extends View {
 
   refresh(cx) {
     this.rememberTarget();
-    const { cwd, on } = location();
-    const next = locationKey();
+    const { cwd: rawCwd, on } = location();
+    let baseRoot = rawCwd;
+    if (rawCwd) {
+      const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
+      if (wtMatch && wtMatch[1]) {
+        baseRoot = wtMatch[1];
+      }
+    }
+    const next = JSON.stringify({ baseRoot, on });
     if (next !== this.context?.key) {
       if (this.context) {
         this.saved.set(this.context.key, {
           folders: this.folders,
           recents: this.recents || [],
+          selectedFeature: this.selectedFeature || null,
           file: this.file,
           history: this.history || [null],
           historyIdx: this.historyIdx || 0,
         });
       }
       const saved = this.saved.get(next);
-      this.context = { key: next, cwd, on };
-      this.root = cwd;
+      this.baseRoot = baseRoot;
+      this.selectedFeature = saved?.selectedFeature || null;
+      this.wtDropdownOpen = false;
+      const activeRoot =
+        this.selectedFeature && baseRoot ? `${baseRoot}/${this.selectedFeature}` : baseRoot;
+      this.context = { key: next, cwd: activeRoot, baseRoot, on };
+      this.root = activeRoot;
       this.on = on;
       this.entries = new Map();
       this.folders = new Set(saved?.folders);
@@ -467,20 +539,48 @@ export default class IdeFiles extends View {
       if (saved?.file) this.show(saved.file, cx, { fromHistory: true });
       if (this.searchMode && this.wsQuery) this.executeWorkspaceSearch(cx);
     }
-    if (!cwd || this.loading) return;
+    if (!baseRoot || this.loading) return;
     const context = this.context;
     this.loading = true;
     this.limited = false;
     cx.spawn(async cx => {
       try {
+        const customWtDirs = shared("ide.worktree_dirs");
+        const wtInfo = await discoverWorktreeFeatures(
+          baseRoot,
+          Array.isArray(customWtDirs)
+            ? customWtDirs
+            : typeof customWtDirs === "string"
+              ? customWtDirs.split(",").map(s => s.trim())
+              : [],
+          on,
+        );
+        if (!this.current(context)) return;
+        this.hasWorktreeDir = wtInfo.hasWorktreeDir;
+        this.wtDirs = wtInfo.wtDirs;
+        this.wtFeatures = wtInfo.features;
+        if (
+          this.selectedFeature &&
+          !this.wtFeatures.some(f => f.relPath === this.selectedFeature)
+        ) {
+          this.selectedFeature = null;
+        }
+        const effectiveRoot =
+          this.selectedFeature && this.baseRoot
+            ? `${this.baseRoot}/${this.selectedFeature}`
+            : this.baseRoot;
+        this.root = effectiveRoot;
+        context.cwd = effectiveRoot;
+
         this.repos = new Set();
         for (const path of ["", ...this.folders]) {
           if (!this.current(context)) return;
           await this.loadFolder(path, context);
         }
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(
-          () => null,
-        );
+        const top = await exec("git", ["rev-parse", "--show-toplevel"], {
+          cwd: effectiveRoot,
+          on,
+        }).catch(() => null);
         if (top?.code === 0 && top.stdout.trim()) {
           this.repos.add(top.stdout.trim());
         }
@@ -493,7 +593,7 @@ export default class IdeFiles extends View {
         this.branches = {};
         this.applyRepoResults(results);
         this.error = null;
-        this.watch(cwd, cx);
+        this.watch(baseRoot, cx);
       } catch (e) {
         if (this.current(context)) this.error = String(e);
       } finally {
@@ -716,12 +816,125 @@ export default class IdeFiles extends View {
     return out;
   }
 
+  renderWorktreeDropdownMenu(t, baseRootName) {
+    const features = this.wtFeatures || [];
+    const activeRel = this.selectedFeature || null;
+    const multipleWtDirs = (this.wtDirs || []).length > 1;
+
+    return div()
+      .id("files-wt-dropdown-backdrop")
+      .absolute()
+      .inset_0()
+      .on_mouse_down("left", (_e, cx) => {
+        cx.stop_propagation();
+        this.wtDropdownOpen = false;
+        cx.notify();
+      })
+      .child(
+        v_flex()
+          .id("files-wt-dropdown-menu")
+          .absolute()
+          .top(31)
+          .left(6)
+          .right(6)
+          .max_h(320)
+          .p(4)
+          .gap(2)
+          .rounded(8)
+          .bg(t.popover)
+          .border_1()
+          .border_color(t.border)
+          .shadow_md()
+          .overflow_y_scrollbar()
+          .text_size(12)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .child(
+            div()
+              .px(8)
+              .py(3)
+              .text_size(10.5)
+              .text_color(t.dim)
+              .child("Workspace Root"),
+          )
+          .child(
+            h_flex()
+              .id("wt-opt-root")
+              .h(26)
+              .px(8)
+              .gap(6)
+              .rounded(5)
+              .items_center()
+              .cursor_pointer()
+              .when(!activeRel, el => el.bg(t.selected).text_color(t.accent))
+              .when(Boolean(activeRel), el =>
+                el.text_color(t.foreground).hover(s => s.bg(t.hover)),
+              )
+              .on_click((_e, cx) => this.selectFeature(null, cx))
+              .child(svg("mods/ide-files/folder.svg").size(13).flex_none().text_color(!activeRel ? t.accent : t.muted))
+              .child(div().flex_1().min_w(0).truncate().child(baseRootName))
+              .child(div().flex_none().text_size(10.5).text_color(t.dim).child("main")),
+          )
+          .child(div().mx(4).my(3).h(1).bg(t.border))
+          .child(
+            div()
+              .px(8)
+              .py(3)
+              .text_size(10.5)
+              .text_color(t.dim)
+              .child(`Parallel Features (${features.length})`),
+          )
+          .when(features.length === 0, menu =>
+            menu.child(
+              div()
+                .px(8)
+                .py(6)
+                .text_size(11.5)
+                .text_color(t.dim)
+                .child(`No features in ${(this.wtDirs && this.wtDirs[0]) || ".worktree"}/`),
+            ),
+          )
+          .children(
+            features.map(feat => {
+              const isSelected = activeRel === feat.relPath;
+              return h_flex()
+                .id(`wt-opt-${feat.relPath}`)
+                .h(26)
+                .px(8)
+                .gap(6)
+                .rounded(5)
+                .items_center()
+                .cursor_pointer()
+                .when(isSelected, el => el.bg(t.selected).text_color(t.accent))
+                .when(!isSelected, el =>
+                  el.text_color(t.foreground).hover(s => s.bg(t.hover)),
+                )
+                .on_click((_e, cx) => this.selectFeature(feat.relPath, cx))
+                .child(
+                  svg("mods/workspace-chrome/git-branch.svg")
+                    .size(12.5)
+                    .flex_none()
+                    .text_color(isSelected ? t.accent : t.muted),
+                )
+                .child(div().flex_1().min_w(0).truncate().child(feat.name))
+                .when(multipleWtDirs, el =>
+                  el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(feat.wtDir)),
+                );
+            }),
+          ),
+      );
+  }
+
   renderExplorerSidebar(t) {
+    const baseRootName = (this.baseRoot || this.root)?.split(/[\\/]/).pop() || "files";
     const rootName = this.root?.split(/[\\/]/).pop() || "files";
     const rootBranch = this.root ? this.branches[this.root] : null;
+    const activeFeatureObj = this.selectedFeature
+      ? (this.wtFeatures || []).find(f => f.relPath === this.selectedFeature)
+      : null;
 
     return v_flex()
       .id("files-explorer-sidebar")
+      .relative()
       .w(RIGHT_SIDEBAR_WIDTH)
       .flex_none()
       .h_full()
@@ -733,12 +946,84 @@ export default class IdeFiles extends View {
           .id("files-header")
           .h(30)
           .flex_none()
-          .pl(10)
+          .pl(8)
           .pr(6)
+          .gap(4)
           .items_center()
           .border_b(1)
           .border_color(t.border)
-          .when(Boolean(rootBranch), hdr =>
+          .when(this.hasWorktreeDir, hdr =>
+            hdr.child(
+              h_flex()
+                .id("files-wt-dropdown-btn")
+                .flex_1()
+                .min_w(0)
+                .h(22)
+                .px(6)
+                .gap(5)
+                .rounded(5)
+                .items_center()
+                .cursor_pointer()
+                .border_1()
+                .border_color(
+                  this.wtDropdownOpen || activeFeatureObj ? t.accent : t.border,
+                )
+                .when(Boolean(activeFeatureObj), el => el.bg(t.selected))
+                .when(!activeFeatureObj && this.wtDropdownOpen, el => el.bg(t.hover))
+                .hover(s => s.bg(activeFeatureObj ? t.selected : t.hover))
+                .tooltip(
+                  activeFeatureObj
+                    ? `Feature Worktree: ${activeFeatureObj.relPath} (点击切换)`
+                    : `Workspace: ${baseRootName} · ${this.wtFeatures.length} worktree features (点击切换)`,
+                )
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  this.wtDropdownOpen = !this.wtDropdownOpen;
+                  cx.notify();
+                })
+                .child(
+                  svg(
+                    activeFeatureObj
+                      ? "mods/workspace-chrome/git-branch.svg"
+                      : "mods/ide-files/folder.svg",
+                  )
+                    .size(12.5)
+                    .flex_none()
+                    .text_color(activeFeatureObj ? t.accent : t.muted),
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(12)
+                    .font_medium()
+                    .text_color(activeFeatureObj ? t.accent : t.foreground)
+                    .child(activeFeatureObj ? activeFeatureObj.name : baseRootName),
+                )
+                .when(!activeFeatureObj && this.wtFeatures.length > 0, el =>
+                  el.child(
+                    div()
+                      .flex_none()
+                      .px(4)
+                      .rounded(3)
+                      .bg(t.raised)
+                      .text_size(10)
+                      .text_color(t.muted)
+                      .child(String(this.wtFeatures.length)),
+                  ),
+                )
+                .child(
+                  svg(
+                    `${ICON_PREFIX}/codicon-chevron-${this.wtDropdownOpen ? "down" : "right"}.svg`,
+                  )
+                    .size(11.5)
+                    .flex_none()
+                    .text_color(t.dim),
+                ),
+            ),
+          )
+          .when(!this.hasWorktreeDir && Boolean(rootBranch), hdr =>
             hdr
               .child(
                 div()
@@ -750,7 +1035,7 @@ export default class IdeFiles extends View {
               )
               .child(renderGitBranchSubtitle(rootBranch, t)),
           )
-          .when(!rootBranch, hdr =>
+          .when(!this.hasWorktreeDir && !rootBranch, hdr =>
             hdr.child(
               div()
                 .flex_1()
@@ -824,6 +1109,9 @@ export default class IdeFiles extends View {
                 .child("File list limited to 500 entries per folder and 5,000 total"),
             ),
           ),
+      )
+      .when(this.hasWorktreeDir && this.wtDropdownOpen, el =>
+        el.child(this.renderWorktreeDropdownMenu(t, baseRootName)),
       );
   }
 
@@ -949,7 +1237,7 @@ export default class IdeFiles extends View {
   }
 
   render(cx) {
-    if (locationKey() !== this.context?.key) this.refresh(cx);
+    if (!this.current(this.context)) this.refresh(cx);
     this.rememberTarget();
     const t = theme();
     const range = this.selectedRange();
