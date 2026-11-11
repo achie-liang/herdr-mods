@@ -8,7 +8,9 @@ echo "==> Installing mods and layout from $REPO_DIR to $APP_HOME"
 
 mkdir -p "$APP_HOME/mods" "$APP_HOME/layouts"
 
-for mod in ide-files ide-changes ide-spaces ide-agents; do
+rm -rf "$APP_HOME/mods/ide-annotate"
+
+for mod in ide-files ide-changes ide-spaces ide-agents ide-review ide-tabs; do
   target="$APP_HOME/mods/$mod"
   if [ -L "$target" ] || [ -d "$target" ]; then
     rm -rf "$target"
@@ -33,6 +35,8 @@ if command -v herdr-app >/dev/null 2>&1; then
   herdr-app check "$APP_HOME/mods/ide-changes"
   herdr-app check "$APP_HOME/mods/ide-spaces"
   herdr-app check "$APP_HOME/mods/ide-agents"
+  herdr-app check "$APP_HOME/mods/ide-review"
+  herdr-app check "$APP_HOME/mods/ide-tabs"
   echo "==> Switching active layout to ide-main"
   herdr-app do layout.switch '{"name":"ide-main"}' || true
 fi

@@ -79,7 +79,7 @@
           "id": "tabs",
           "type": "block",
           "content": {
-            "mod": "tabs"
+            "mod": "ide-tabs"
           },
           "size": {
             "px": 42
@@ -139,6 +139,13 @@
                       "type": "block",
                       "content": {
                         "mod": "ide-changes"
+                      }
+                    },
+                    {
+                      "id": "review",
+                      "type": "block",
+                      "content": {
+                        "mod": "ide-review"
                       }
                     }
                   ],

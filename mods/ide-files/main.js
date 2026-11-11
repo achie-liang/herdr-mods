@@ -881,7 +881,7 @@ export default class IdeFiles extends View {
               .py(3)
               .text_size(10.5)
               .text_color(t.dim)
-              .child(`Parallel Features (${features.length})`),
+              .child(`Worktree Branches (${features.length})`),
           )
           .when(features.length === 0, menu =>
             menu.child(
@@ -890,7 +890,7 @@ export default class IdeFiles extends View {
                 .py(6)
                 .text_size(11.5)
                 .text_color(t.dim)
-                .child(`No features in ${(this.wtDirs && this.wtDirs[0]) || ".worktree"}/`),
+                .child(`No worktrees in ${(this.wtDirs && this.wtDirs[0]) || ".worktree"}/`),
             ),
           )
           .children(

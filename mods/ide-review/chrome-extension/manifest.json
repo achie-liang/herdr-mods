@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "Herdr UI Review",
+  "version": "1.4.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq4w3me1MoJcqd0KoBOchgSla6UORnnQYDyGZt8HnNWLfHa+WtE5iQkIcqFvFZoYvIkyrVdDKSNCbRd+WtXAUn+3i5t+gR5MmyiIs36mnUxU8V7ED/cwOZr2yYxhkIjAjBbhy7hvC/ni15hltY8XtUWMFDWRs4ABj+3EwYQ9DvdGNWd2mfkt6OTqzVZuoAvsGGRqdLeWz2V6pB94+C99tE6vwLxZcmHBT6V7pRTgqpu+G7Mb694nURHmmvBXkInIxOzKFBUXMI1CrKRJoRyTS/VjqOE+7iQnBqZwSbQT8jTVVSt5S/iPD4gURBEslbFPXANRn5PqnnsIJaMuW2ODtGQIDAQAB",
+  "description": "Batch-review UI elements & regions with React/Vue source locations and send them directly to Herdr coding agents.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:17501/*",
+    "http://localhost:17501/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Toggle Herdr UI Review (Alt+Shift+A)",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "toggle-annotator": {
+      "suggested_key": {
+        "default": "Alt+Shift+A",
+        "mac": "Alt+Shift+A"
+      },
+      "description": "Toggle Herdr UI Review Mode on the current page"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["page-hook.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}

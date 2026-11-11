@@ -36,6 +36,7 @@
     "cmd-shift-/": "app.help",
     "cmd-b": "layout.toggle:sidebar",
     "cmd-shift-f": "ide-files.search_files",
+    "cmd-shift-a": "ide-tabs.toggle_review",
     "cmd-=": "app.zoom_in",
     "cmd-+": "app.zoom_in",
     "cmd--": "app.zoom_out",
@@ -79,5 +80,9 @@
   },
   "mod:ide-changes": {
     "cmd-f": "ide-changes.find"
+  },
+  "mod:ide-review": {
+    "cmd-enter": "ide-review.paste_all",
+    "cmd-shift-enter": "ide-review.send_all"
   }
 }
