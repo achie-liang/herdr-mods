@@ -79,7 +79,9 @@
     "cmd-shift-g": "ide-files.find_prev"
   },
   "mod:ide-changes": {
-    "cmd-f": "ide-changes.find"
+    "cmd-f": "ide-changes.find",
+    "alt-[": "ide-changes.prev_file",
+    "alt-]": "ide-changes.next_file"
   },
   "mod:ide-review": {
     "cmd-enter": "ide-review.paste_all",

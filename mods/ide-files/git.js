@@ -1,6 +1,6 @@
 import { div } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { exec, window } from "herdr";
+import { exec, window, shared, setShared } from "herdr";
 import { TOTAL, STATUS_PRIORITY } from "./utils.js";
 
 export async function listDirectory(path, on) {
@@ -215,3 +215,39 @@ export function renderGitBranchSubtitle(branch, t) {
     .text_color(t.dim)
     .child(div().flex_none().child(`git:(${display})`));
 }
+
+const SHARED_WT_KEY = "ide.worktree_state";
+
+export function readSharedWtState(contextKey) {
+  if (!contextKey) return null;
+  try {
+    const all = shared(SHARED_WT_KEY);
+    if (all && typeof all === "object") {
+      return all[contextKey] || null;
+    }
+  } catch {}
+  return null;
+}
+
+export function writeSharedWtState(contextKey, selectedFeature, userPinnedRoot) {
+  if (!contextKey) return;
+  try {
+    const prev = shared(SHARED_WT_KEY);
+    const all = prev && typeof prev === "object" ? { ...prev } : {};
+    const cur = all[contextKey];
+    if (
+      cur &&
+      (cur.selectedFeature || null) === (selectedFeature || null) &&
+      Boolean(cur.userPinnedRoot) === Boolean(userPinnedRoot)
+    ) {
+      return;
+    }
+    all[contextKey] = {
+      selectedFeature: selectedFeature || null,
+      userPinnedRoot: Boolean(userPinnedRoot),
+      updatedAt: Date.now(),
+    };
+    setShared(SHARED_WT_KEY, all);
+  } catch {}
+}
+

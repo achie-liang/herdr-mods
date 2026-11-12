@@ -12,10 +12,11 @@ rm -rf "$APP_HOME/mods/ide-annotate"
 
 for mod in ide-files ide-changes ide-spaces ide-agents ide-review ide-tabs; do
   target="$APP_HOME/mods/$mod"
-  if [ -L "$target" ] || [ -d "$target" ]; then
-    rm -rf "$target"
+  if [ -L "$target" ]; then
+    rm -f "$target"
   fi
-  cp -R "$REPO_DIR/mods/$mod" "$target"
+  mkdir -p "$target"
+  cp -R "$REPO_DIR/mods/$mod/"* "$target/"
   echo "  Installed mod: $target"
 done
 

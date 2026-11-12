@@ -31,6 +31,8 @@ import {
   inspectGitRepo,
   discoverWorktreeFeatures,
   renderGitBranchSubtitle,
+  readSharedWtState,
+  writeSharedWtState,
 } from "./git.js";
 import { searchMethods } from "./search.js";
 import { previewMethods } from "./preview.js";
@@ -52,6 +54,7 @@ export default class IdeFiles extends View {
           folders: new Set(v.folders || []),
           recents: Array.isArray(v.recents) ? v.recents : [],
           selectedFeature: v.selectedFeature || null,
+          userPinnedRoot: Boolean(v.userPinnedRoot),
           file: null,
         });
       }
@@ -61,7 +64,11 @@ export default class IdeFiles extends View {
     this.wtDirs = [];
     this.wtFeatures = [];
     this.selectedFeature = null;
+    this.userPinnedRoot = false;
     this.wtDropdownOpen = false;
+    const initReq = shared("ide.open_file_request");
+    this.lastOpenReqId =
+      initReq && initReq.ts && Date.now() - initReq.ts > 5000 ? initReq.id : null;
     this.entries = new Map();
     this.folders = new Set();
     this.pending = new Set();
@@ -258,6 +265,12 @@ export default class IdeFiles extends View {
       for (;;) {
         const cmd = await nextCommand();
         if (!cmd) continue;
+        this.syncSharedWorktree(cx);
+        if (this.consumeOpenRequest(cx)) {
+          this.handle.focus();
+          cx.notify();
+          continue;
+        }
         if (cmd === "focus") {
           this.handle.focus();
         } else if (cmd === "find") {
@@ -284,6 +297,7 @@ export default class IdeFiles extends View {
       folders: new Set(this.folders),
       recents: [...(this.recents || [])],
       selectedFeature: this.selectedFeature || null,
+      userPinnedRoot: Boolean(this.userPinnedRoot),
       file: this.file,
       history: [...(this.history || [null])],
       historyIdx: this.historyIdx || 0,
@@ -295,20 +309,24 @@ export default class IdeFiles extends View {
           folders: [...(v.folders || [])],
           recents: [...(v.recents || [])],
           selectedFeature: v.selectedFeature || null,
+          userPinnedRoot: Boolean(v.userPinnedRoot),
         };
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
     } catch {}
+    writeSharedWtState(this.context.key, this.selectedFeature, this.userPinnedRoot);
   }
 
-  selectFeature(relPath, cx) {
+  selectFeature(relPath, cx, opts = null) {
     const nextFeature = relPath || null;
+    const nextPinned = !nextFeature;
     this.wtDropdownOpen = false;
-    if (this.selectedFeature === nextFeature) {
+    if (this.selectedFeature === nextFeature && this.userPinnedRoot === nextPinned) {
       cx.notify();
       return;
     }
     this.selectedFeature = nextFeature;
+    this.userPinnedRoot = nextPinned;
     this.root =
       this.selectedFeature && this.baseRoot
         ? `${this.baseRoot}/${this.selectedFeature}`
@@ -327,9 +345,11 @@ export default class IdeFiles extends View {
     this.wsIndex = [];
     this.wsIndexRoot = null;
     this.wsIndexLoading = false;
-    this.history = [null];
-    this.historyIdx = 0;
-    this.show(null, null, { fromHistory: true });
+    if (!opts?.keepOpenFile) {
+      this.history = [null];
+      this.historyIdx = 0;
+      this.show(null, null, { fromHistory: true });
+    }
     this.persistFolders();
     this.loading = false;
     this.refresh(cx);
@@ -337,6 +357,60 @@ export default class IdeFiles extends View {
       this.executeWorkspaceSearch(cx);
     }
     cx.notify();
+  }
+
+  syncSharedWorktree(cx) {
+    if (!this.context?.key) return;
+    const sharedState = readSharedWtState(this.context.key);
+    if (!sharedState) return;
+    const wantFeature = sharedState.selectedFeature || null;
+    const wantPinned = Boolean(sharedState.userPinnedRoot);
+    if (wantFeature !== (this.selectedFeature || null)) {
+      this.userPinnedRoot = wantPinned;
+      this.selectFeature(wantFeature, cx);
+    } else if (wantPinned !== Boolean(this.userPinnedRoot)) {
+      this.userPinnedRoot = wantPinned;
+    }
+  }
+
+  consumeOpenRequest(cx) {
+    try {
+      const req = shared("ide.open_file_request");
+      if (!req || typeof req !== "object" || !req.id || req.id === this.lastOpenReqId) {
+        return false;
+      }
+      this.lastOpenReqId = req.id;
+      if (req.ts && Date.now() - req.ts > 15000) {
+        return false;
+      }
+
+      if (!this.current(this.context)) {
+        this.refresh(cx);
+      }
+      if (req.baseRoot && !this.baseRoot) {
+        this.baseRoot = req.baseRoot;
+      }
+      const wantFeature = req.selectedFeature || null;
+      if (wantFeature !== (this.selectedFeature || null)) {
+        this.selectFeature(wantFeature, cx, { keepOpenFile: true });
+      } else if (this.baseRoot) {
+        this.root = this.selectedFeature
+          ? `${this.baseRoot}/${this.selectedFeature}`
+          : this.baseRoot;
+      }
+      if (req.path) {
+        this.searchMode = false;
+        this.rawEditor = false;
+        this.show(
+          req.path,
+          cx,
+          req.lineNo != null ? { lineNo: req.lineNo } : null,
+        );
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   rememberTarget() {
@@ -488,10 +562,12 @@ export default class IdeFiles extends View {
     this.rememberTarget();
     const { cwd: rawCwd, on } = location();
     let baseRoot = rawCwd;
+    let detectedFeature = null;
     if (rawCwd) {
       const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
       if (wtMatch && wtMatch[1]) {
         baseRoot = wtMatch[1];
+        detectedFeature = `${wtMatch[2]}/${wtMatch[3]}`;
       }
     }
     const next = JSON.stringify({ baseRoot, on });
@@ -501,14 +577,24 @@ export default class IdeFiles extends View {
           folders: this.folders,
           recents: this.recents || [],
           selectedFeature: this.selectedFeature || null,
+          userPinnedRoot: Boolean(this.userPinnedRoot),
           file: this.file,
           history: this.history || [null],
           historyIdx: this.historyIdx || 0,
         });
       }
       const saved = this.saved.get(next);
+      const sharedState = readSharedWtState(next);
       this.baseRoot = baseRoot;
-      this.selectedFeature = saved?.selectedFeature || null;
+      this.selectedFeature =
+        sharedState?.selectedFeature ??
+        saved?.selectedFeature ??
+        detectedFeature ??
+        null;
+      this.userPinnedRoot =
+        sharedState !== null
+          ? Boolean(sharedState.userPinnedRoot)
+          : Boolean(saved?.userPinnedRoot);
       this.wtDropdownOpen = false;
       const activeRoot =
         this.selectedFeature && baseRoot ? `${baseRoot}/${this.selectedFeature}` : baseRoot;
@@ -564,6 +650,13 @@ export default class IdeFiles extends View {
           !this.wtFeatures.some(f => f.relPath === this.selectedFeature)
         ) {
           this.selectedFeature = null;
+        }
+        if (this.wtFeatures.length === 0) {
+          this.userPinnedRoot = false;
+        }
+        if (!this.selectedFeature && !this.userPinnedRoot && this.wtFeatures.length > 0) {
+          this.selectedFeature = this.wtFeatures[0].relPath;
+          this.persistFolders();
         }
         const effectiveRoot =
           this.selectedFeature && this.baseRoot
@@ -838,7 +931,7 @@ export default class IdeFiles extends View {
           .left(6)
           .right(6)
           .max_h(320)
-          .p(4)
+          .py(5)
           .gap(2)
           .rounded(8)
           .bg(t.popover)
@@ -850,7 +943,8 @@ export default class IdeFiles extends View {
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .child(
             div()
-              .px(8)
+              .mx(5)
+              .px(6)
               .py(3)
               .text_size(10.5)
               .text_color(t.dim)
@@ -859,6 +953,7 @@ export default class IdeFiles extends View {
           .child(
             h_flex()
               .id("wt-opt-root")
+              .mx(5)
               .h(26)
               .px(8)
               .gap(6)
@@ -872,25 +967,27 @@ export default class IdeFiles extends View {
               .on_click((_e, cx) => this.selectFeature(null, cx))
               .child(svg("mods/ide-files/folder.svg").size(13).flex_none().text_color(!activeRel ? t.accent : t.muted))
               .child(div().flex_1().min_w(0).truncate().child(baseRootName))
-              .child(div().flex_none().text_size(10.5).text_color(t.dim).child("main")),
+              .child(div().flex_none().pl(4).text_size(10.5).text_color(t.dim).child("main")),
           )
-          .child(div().mx(4).my(3).h(1).bg(t.border))
+          .child(div().mx(8).my(3).h(1).bg(t.border))
           .child(
             div()
-              .px(8)
+              .mx(5)
+              .px(6)
               .py(3)
               .text_size(10.5)
               .text_color(t.dim)
-              .child(`Worktree Branches (${features.length})`),
+              .child(`Parallel Features (${features.length})`),
           )
           .when(features.length === 0, menu =>
             menu.child(
               div()
-                .px(8)
+                .mx(5)
+                .px(6)
                 .py(6)
                 .text_size(11.5)
                 .text_color(t.dim)
-                .child(`No worktrees in ${(this.wtDirs && this.wtDirs[0]) || ".worktree"}/`),
+                .child(`No features in ${(this.wtDirs && this.wtDirs[0]) || ".worktree"}/`),
             ),
           )
           .children(
@@ -898,6 +995,7 @@ export default class IdeFiles extends View {
               const isSelected = activeRel === feat.relPath;
               return h_flex()
                 .id(`wt-opt-${feat.relPath}`)
+                .mx(5)
                 .h(26)
                 .px(8)
                 .gap(6)
@@ -917,7 +1015,7 @@ export default class IdeFiles extends View {
                 )
                 .child(div().flex_1().min_w(0).truncate().child(feat.name))
                 .when(multipleWtDirs, el =>
-                  el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(feat.wtDir)),
+                  el.child(div().flex_none().pl(4).text_size(10.5).text_color(t.dim).child(feat.wtDir)),
                 );
             }),
           ),
@@ -1236,8 +1334,39 @@ export default class IdeFiles extends View {
       .child(svg(`${ICON_PREFIX}/codicon-${iconName}.svg`).size(13.5));
   }
 
+  checkPendingSync(cx) {
+    if (this.syncTaskScheduled) return;
+    const req = shared("ide.open_file_request");
+    const hasOpenReq =
+      req &&
+      typeof req === "object" &&
+      req.id &&
+      req.id !== this.lastOpenReqId &&
+      (!req.ts || Date.now() - req.ts <= 15000);
+
+    const sharedState = this.context?.key ? readSharedWtState(this.context.key) : null;
+    const hasWtChange =
+      sharedState &&
+      ((sharedState.selectedFeature || null) !== (this.selectedFeature || null) ||
+        Boolean(sharedState.userPinnedRoot) !== Boolean(this.userPinnedRoot));
+
+    if (!hasOpenReq && !hasWtChange) return;
+    this.syncTaskScheduled = true;
+    cx.spawn(async cx => {
+      try {
+        await cx.sleep(1);
+        this.syncSharedWorktree(cx);
+        this.consumeOpenRequest(cx);
+      } finally {
+        this.syncTaskScheduled = false;
+        cx.notify();
+      }
+    });
+  }
+
   render(cx) {
     if (!this.current(this.context)) this.refresh(cx);
+    this.checkPendingSync(cx);
     this.rememberTarget();
     const t = theme();
     const range = this.selectedRange();

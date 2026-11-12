@@ -45,13 +45,27 @@ export const GIT_DOT_COLOR = {
 
 export const STATUS_PRIORITY = { C: 5, D: 4, M: 3, A: 2, U: 1 };
 
+let lastFocusedPaneId = null;
+
 export function location() {
   const space = spaces().find(s => s.active);
   const f = focused();
-  const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
+  if (f?.pane) {
+    lastFocusedPaneId = f.pane;
+  }
+  const activeTab = space?.tabs?.find(t => t.active);
+  const allPanes = panes();
+  const pane =
+    (f?.pane && allPanes.find(p => p.pane === f.pane)) ||
+    (lastFocusedPaneId &&
+      allPanes.find(
+        p => p.pane === lastFocusedPaneId && (!activeTab || p.tab === activeTab.id),
+      )) ||
+    (activeTab && allPanes.find(p => p.tab === activeTab.id)) ||
+    null;
   const on =
-    f?.pane === null
-      ? f.terminal?.includes("/")
+    f?.pane === null && f?.terminal
+      ? f.terminal.includes("/")
         ? f.terminal.split("/")[0]
         : null
       : (space?.machine ?? null);

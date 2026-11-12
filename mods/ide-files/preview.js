@@ -400,7 +400,9 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       }
     }
 
-    this.code?.release();
+    try {
+      this.code?.release();
+    } catch {}
     this.code = null;
     this.file = path;
     this.rawText = "";
@@ -433,24 +435,31 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
 
     if (!cx) return;
 
-    this.handle.focus();
+    try {
+      this.handle.focus();
+    } catch {}
     if (jumpOpts?.query) {
       this.rawEditor = false;
       this.mdPreview = false;
       this.findQuery = jumpOpts.query;
-      this.findInput.set_value(jumpOpts.query);
+      try {
+        this.findInput.set_value(jumpOpts.query);
+      } catch {}
       if (typeof jumpOpts.caseSensitive === "boolean") this.findCase = jumpOpts.caseSensitive;
       if (typeof jumpOpts.wholeWord === "boolean") this.findWord = jumpOpts.wholeWord;
       if (typeof jumpOpts.regex === "boolean") this.findRegex = jumpOpts.regex;
     }
 
-    const context = this.context;
-    const root = this.root;
+    const root =
+      this.root ||
+      (this.selectedFeature && this.baseRoot
+        ? `${this.baseRoot}/${this.selectedFeature}`
+        : this.baseRoot);
     const on = this.on;
     cx.spawn(async cx => {
       try {
         const text = await readTextFile(`${root}/${path}`, { on });
-        if (this.file !== path || !this.current(context)) return;
+        if (this.file !== path) return;
         if (text === null) {
           this.fileError = "This file is no longer available";
           return;
@@ -469,30 +478,32 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
         const t = theme();
         const ext = path.includes(".") ? path.split(".").pop() : "txt";
         this.fileExt = (ext || "txt").toLowerCase();
-        this.code = EditorState.new({
-          language: LANG[this.fileExt] ?? this.fileExt,
-          readonly: truncated,
-          value: clipped,
-          font_family: settings().font_family,
-          font_size: 12,
-          syntax: {
-            keyword: t.ansi5,
-            string: t.ansi2,
-            comment: t.dim,
-            function: t.ansi4,
-            type: t.ansi3,
-            number: t.ansi1,
-            constant: t.ansi6,
-          },
-        });
-        this.code.on("change", (_e, cx) => {
-          if (!this.code || this.file !== path || this.fileTruncated) return;
-          const nextVal = this.code.value();
-          if (nextVal === this.rawText) return;
-          this.rawText = nextVal;
-          this.lines = nextVal.replace(/\r\n/g, "\n").split("\n");
-          this.scheduleSaveEditedFile(path, nextVal, cx);
-        });
+        try {
+          this.code = EditorState.new({
+            language: LANG[this.fileExt] ?? this.fileExt,
+            readonly: truncated,
+            value: clipped,
+            font_family: settings().font_family,
+            font_size: 12,
+            syntax: {
+              keyword: t.ansi5,
+              string: t.ansi2,
+              comment: t.dim,
+              function: t.ansi4,
+              type: t.ansi3,
+              number: t.ansi1,
+              constant: t.ansi6,
+            },
+          });
+          this.code.on("change", (_e, cx) => {
+            if (!this.code || this.file !== path || this.fileTruncated) return;
+            const nextVal = this.code.value();
+            if (nextVal === this.rawText) return;
+            this.rawText = nextVal;
+            this.lines = nextVal.replace(/\r\n/g, "\n").split("\n");
+            this.scheduleSaveEditedFile(path, nextVal, cx);
+          });
+        } catch {}
         if ((this.findOpen || jumpOpts?.query) && this.findQuery) {
           const prevOpen = this.findOpen;
           this.findOpen = true;
@@ -500,17 +511,19 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
           this.findOpen = prevOpen;
         }
         if (jumpOpts?.lineNo != null) {
+          this.rawEditor = false;
           this.mdPreview = false;
-          const ln = jumpOpts.lineNo;
+          const ln = Math.max(1, Math.min(this.lines.length || 1, jumpOpts.lineNo));
           const lineLen = (this.lines[ln - 1] || "").length;
           this.selStart = ln;
           this.selEnd = ln;
           this.selAnchor = { lineNo: ln, col: 0 };
           this.selFocus = { lineNo: ln, col: lineLen };
+          this.pendingScrollLine = ln;
           this.scrollToLine(ln);
         }
       } catch {
-        if (this.file === path && this.current(context)) {
+        if (this.file === path) {
           this.fileError = "Cannot preview this file (binary, too large, or unreadable)";
         }
       } finally {
@@ -1080,11 +1093,16 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       .on_size_change((size, cx) => {
         if (size.height > 0 && Math.abs((this.linesViewHeight || 0) - size.height) > 1) {
           this.linesViewHeight = size.height;
+          if (this.pendingScrollLine != null) {
+            this.scrollToLine(this.pendingScrollLine);
+            this.pendingScrollLine = null;
+          }
           cx.notify();
         }
       })
       .on_scroll_wheel((e, cx) => {
         if (maxScroll <= 0) return;
+        this.pendingScrollLine = null;
         this.lineScroll = Math.max(0, Math.min(maxScroll, this.lineScroll - e.delta.y));
         cx.notify();
       })
