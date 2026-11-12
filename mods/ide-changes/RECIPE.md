@@ -6,18 +6,30 @@ A multi-repo and Git worktree-aware source control & diff viewer mod for Herdr. 
 
 ## What you see
 
-- **Header (42px):** Shows `Changes`, a badge with total changed files (`N files`), a badge with active repository count (`M repos`) when in a multi-repo workspace, and total `+add` / `−del` line counts.
-- **Changed Files / Repo Groups List (up to 240px height):**
-  - **Single-repo mode:** Flat list of changed files (28px rows) with status letter (`A`, `M`, `D`, `U`), dimmed directory prefix, filename, and `+add` / `−del` counts.
-  - **Multi-repo mode:** Collapsible repository group headers (28px rows) with chevron icon, bold repo relative path (e.g. `pace-mono` or `.worktree/feat-x/pace-mono`), colored `git:(branch)` subtitle, file count badge, and repo-level `+add` / `−del` totals. Indented file rows appear underneath each expanded repo.
-- **Virtualized Unified Diff View:** Monospace diff viewer (`v_virtual_list`) with old/new line numbers, green/red line highlights (`t.ansi2` / `t.ansi1`), and horizontal + vertical scrollbars.
-- **Commit Bar (52px):** Shows a target repository badge (in multi-repo mode), a `Commit message` input (`32px` height), and a `Commit` button.
+- **Unified Top Bar (36px):**
+  - Left: Back and Forward navigation buttons (`22×22px`) to step through previously viewed changed files.
+  - Center: Clickable **File Path Breadcrumbs** (`repo > folder > subfolder > file`) with Seti file icon, Git status badge (`M`, `A`, `D`, `U`), and `+add` / `−del` line counts.
+  - Right: `Open File in Files` button and Right Sidebar Toggle (`panel-right`).
+- **Left Content Diff Pane (`flex_1`):**
+  - Virtualized monospace unified diff viewer (`20px` row height) with old/new line numbers, green/red line highlights (`t.ansi2` / `t.ansi1`), hover highlight, and vertical scrollbar.
+- **Right Changes File Tree Sidebar (260px width, collapsible):**
+  - **Sidebar Header (30px):** Aligned with `ide-files` — shows the interactive **Feature Worktree Dropdown (`22px` height)** when parallel worktree directories exist (or repo name + `git:(branch)` subtitle), plus Refresh and Collapse All icon buttons (`22×22px`).
+  - **Filter Files Bar:** Compact filter input (`Filter files… (⌘F)`) directly under the sidebar header.
+  - **Hierarchical Changes File Tree (24px rows):**
+    - In multi-repo workspaces, top-level nodes are collapsible repository headers with `git:(branch)` subtitles and changed file counts.
+    - Inside each repository, changed files are organized as an indented folder/file tree with `1px` indent guide lines, folder chevrons, Seti colored file icons, Git status colors, and `+add` / `−del` counts.
+  - **Commit Bar:** Target repository indicator, `Commit message` input, and `Commit` button at the bottom of the sidebar.
 
 ## How it behaves
 
+- **Worktree Feature Switching & Sync:**
+  - Discovers parallel worktree directories (`.worktree`, `worktree`, `.worktrees`, `worktrees`, `.herdr.json`, `shared("ide.worktree_dirs")`, or auto-detected via `git worktree list`) and syncs the selected feature with `ide-files` via `localStorage` (`ide-worktree.state`).
+  - Automatically selects the active feature worktree when one exists unless the user explicitly selects `Workspace Root (main)`.
+- **Double-Click to Open File & Jump to Diff Line:**
+  - Single-clicking a file row in the changed file list previews its diff in `Changes`; **double-clicking** a file row switches to the `Files` (`ide-files`) panel and opens that file.
+  - **Double-clicking** any line in the diff view switches to the `Files` (`ide-files`) panel, opens the file, and scrolls/highlights that exact line number.
 - **Single vs. Multi-Repo Detection:**
-  - First checks `git rev-parse --show-toplevel` in the active pane's `cwd`.
-  - If `cwd` is not itself a Git repository, scans immediate subdirectories (`*`, `.[!.]*`) and nested worktrees (`.worktree/*/*`) for `.git` directories/files.
+  - Scans immediate child repositories (`*`, `.[!.]*`) inside the active root (workspace root or selected `.worktree/<feature>`), falling back to `git rev-parse --show-toplevel` for single-repository roots.
 - **Non-Locking Live Refresh:** Uses `--no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false` so `watchFolder` never loops on `.git/index.lock`.
 - **Targeted Commits:** Clicking any repo header or file row sets that repository as the active commit target (`activeRepoRoot`). Entering a commit message and pressing Enter (or clicking `Commit`) runs `git add -A` and `git commit -m <message>` inside that specific repository.
 
