@@ -63,6 +63,7 @@ export default class IdeFiles extends View {
     this.hasWorktreeDir = false;
     this.wtDirs = [];
     this.wtFeatures = [];
+    this.wtLoaded = false;
     this.selectedFeature = null;
     this.userPinnedRoot = false;
     this.wtDropdownOpen = false;
@@ -363,8 +364,17 @@ export default class IdeFiles extends View {
     if (!this.context?.key) return;
     const sharedState = readSharedWtState(this.context.key);
     if (!sharedState) return;
-    const wantFeature = sharedState.selectedFeature || null;
-    const wantPinned = Boolean(sharedState.userPinnedRoot);
+    let wantFeature = sharedState.selectedFeature || null;
+    let wantPinned = Boolean(sharedState.userPinnedRoot);
+    if (
+      wantFeature &&
+      this.wtLoaded &&
+      !this.wtFeatures.some(f => f.relPath === wantFeature)
+    ) {
+      wantFeature = null;
+      wantPinned = this.wtFeatures.length > 0;
+      writeSharedWtState(this.context.key, null, wantPinned);
+    }
     if (wantFeature !== (this.selectedFeature || null)) {
       this.userPinnedRoot = wantPinned;
       this.selectFeature(wantFeature, cx);
@@ -596,6 +606,7 @@ export default class IdeFiles extends View {
           ? Boolean(sharedState.userPinnedRoot)
           : Boolean(saved?.userPinnedRoot);
       this.wtDropdownOpen = false;
+      this.wtLoaded = false;
       const activeRoot =
         this.selectedFeature && baseRoot ? `${baseRoot}/${this.selectedFeature}` : baseRoot;
       this.context = { key: next, cwd: activeRoot, baseRoot, on };
@@ -645,17 +656,33 @@ export default class IdeFiles extends View {
         this.hasWorktreeDir = wtInfo.hasWorktreeDir;
         this.wtDirs = wtInfo.wtDirs;
         this.wtFeatures = wtInfo.features;
+        this.wtLoaded = true;
+        let wtChanged = false;
         if (
           this.selectedFeature &&
           !this.wtFeatures.some(f => f.relPath === this.selectedFeature)
         ) {
           this.selectedFeature = null;
+          this.userPinnedRoot = this.wtFeatures.length > 0;
+          this.entries = new Map();
+          this.folders = new Set();
+          this.pending = new Set();
+          this.wsIndex = [];
+          this.wsIndexRoot = null;
+          this.history = [null];
+          this.historyIdx = 0;
+          this.show(null, null, { fromHistory: true });
+          wtChanged = true;
         }
-        if (this.wtFeatures.length === 0) {
+        if (this.wtFeatures.length === 0 && this.userPinnedRoot) {
           this.userPinnedRoot = false;
+          wtChanged = true;
         }
         if (!this.selectedFeature && !this.userPinnedRoot && this.wtFeatures.length > 0) {
           this.selectedFeature = this.wtFeatures[0].relPath;
+          wtChanged = true;
+        }
+        if (wtChanged) {
           this.persistFolders();
         }
         const effectiveRoot =
@@ -1345,9 +1372,15 @@ export default class IdeFiles extends View {
       (!req.ts || Date.now() - req.ts <= 15000);
 
     const sharedState = this.context?.key ? readSharedWtState(this.context.key) : null;
+    const rawWantFeature = sharedState ? sharedState.selectedFeature || null : null;
+    const validWantFeature =
+      rawWantFeature && this.wtLoaded && !this.wtFeatures.some(f => f.relPath === rawWantFeature)
+        ? null
+        : rawWantFeature;
     const hasWtChange =
       sharedState &&
-      ((sharedState.selectedFeature || null) !== (this.selectedFeature || null) ||
+      (validWantFeature !== (this.selectedFeature || null) ||
+        rawWantFeature !== validWantFeature ||
         Boolean(sharedState.userPinnedRoot) !== Boolean(this.userPinnedRoot));
 
     if (!hasOpenReq && !hasWtChange) return;
