@@ -100,7 +100,9 @@ export default class IdeTabs extends View {
         cwd: ctx.cwd,
         focused: ctx.focused,
         activeSpace: ctx.activeSpace,
-        agents: ctx.agents.map(a => `${a.address}:${a.status}:${a.focused}`),
+        agents: ctx.agents.map(
+          a => `${a.address}:${a.status}:${a.focused}:${a.sessionName || ""}:${a.displayLabel || ""}`,
+        ),
       });
       if (key === this.lastContextKey) return;
       this.lastContextKey = key;

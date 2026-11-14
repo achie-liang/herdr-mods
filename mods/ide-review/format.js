@@ -1,4 +1,4 @@
-import { spaces, panes, agents, focused, run, hc, notify, appHome } from "herdr";
+import { spaces, panes, agents, terminals, focused, run, hc, notify, appHome, shared } from "herdr";
 
 export const BRIDGE_PORT = 17501;
 export const BRIDGE_URL = `http://127.0.0.1:${BRIDGE_PORT}`;
@@ -27,6 +27,51 @@ export function bundledExtensionDir() {
   return `${appHome()}/mods/ide-review/chrome-extension`;
 }
 
+export function truncateSessionName(raw, maxLen = 16) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  return s.length > maxLen ? `${s.slice(0, maxLen)}...` : s;
+}
+
+export function resolveAgentSessionName(a, termMap, sharedSessions) {
+  const term = termMap?.get(a.address);
+  const fromLabel = term?.labels?.["herdr.session"];
+  if (fromLabel) return String(fromLabel).trim();
+  const fromShared = sharedSessions?.[a.address];
+  if (fromShared) return String(fromShared).trim();
+  if (a.title && a.title.startsWith("π - ")) {
+    const parts = a.title.slice(4).split(" - ");
+    if (parts.length >= 2) return parts.slice(0, -1).join(" - ").trim();
+  }
+  const tabName = a.tab_name || a.tabName || "";
+  if (tabName && !/^tb?\d+$|^\d+$/.test(tabName) && tabName !== (a.program?.name || a.programName)) {
+    return tabName.trim();
+  }
+  const title = (a.title || "").trim();
+  if (
+    title &&
+    title !== (a.program?.name || a.programName) &&
+    !/^[~/]|^[A-Za-z]:\\/.test(title) &&
+    !title.includes("@")
+  ) {
+    return title;
+  }
+  return "";
+}
+
+export function formatAgentDisplayLabel(a, termMap = null, sharedSessions = null) {
+  const agentName = a.program?.name || a.programName || a.title || "Agent";
+  const spaceName = a.space_name || a.spaceName || "space";
+  const rawSession =
+    a.sessionName !== undefined
+      ? a.sessionName
+      : resolveAgentSessionName(a, termMap, sharedSessions);
+  const shortSession = truncateSessionName(rawSession || a.address || "", 16);
+  return shortSession
+    ? `${agentName} · ${spaceName} (${shortSession})`
+    : `${agentName} · ${spaceName}`;
+}
+
 export function currentWorkspaceContext() {
   const allSpaces = spaces();
   const activeSpace = allSpaces.find(s => s.active) || allSpaces[0] || null;
@@ -34,6 +79,11 @@ export function currentWorkspaceContext() {
   const allPanes = panes();
   const focusedPane = f?.pane ? allPanes.find(p => p.pane === f.pane) : null;
   const allAgents = agents();
+  const termMap = new Map(terminals().map(t => [t.address, t]));
+  let sharedSessions = null;
+  try {
+    sharedSessions = shared("ide.agent_sessions") || null;
+  } catch {}
   const activeAgent =
     allAgents.find(a => a.focused) ||
     (f?.terminal ? allAgents.find(a => a.address === f.terminal) : null) ||
@@ -62,19 +112,25 @@ export function currentWorkspaceContext() {
           branch: activeSpace.branch,
         }
       : null,
-    agents: allAgents.map(a => ({
-      address: a.address,
-      pane: a.pane,
-      space: a.space,
-      spaceName: a.space_name,
-      tab: a.tab,
-      tabName: a.tab_name,
-      status: a.status,
-      app: a.app || a.program?.key || "agent",
-      programName: a.program?.name || a.title || "Agent",
-      title: a.title,
-      focused: a.focused,
-    })),
+    agents: allAgents.map(a => {
+      const sessionName = resolveAgentSessionName(a, termMap, sharedSessions);
+      const item = {
+        address: a.address,
+        pane: a.pane,
+        space: a.space,
+        spaceName: a.space_name,
+        tab: a.tab,
+        tabName: a.tab_name,
+        status: a.status,
+        app: a.app || a.program?.key || "agent",
+        programName: a.program?.name || a.title || "Agent",
+        title: a.title,
+        sessionName,
+        focused: a.focused,
+      };
+      item.displayLabel = formatAgentDisplayLabel(item, termMap, sharedSessions);
+      return item;
+    }),
   };
 }
 
@@ -263,6 +319,11 @@ export function formatMultiBatchPrompt(batches, options = {}) {
 export function resolveTargetAgent(preferredTerminal, preferredPane) {
   const allAgents = agents();
   const allPanes = panes();
+  const termMap = new Map(terminals().map(t => [t.address, t]));
+  let sharedSessions = null;
+  try {
+    sharedSessions = shared("ide.agent_sessions") || null;
+  } catch {}
   const f = focused();
 
   if (preferredTerminal && preferredTerminal !== "default") {
@@ -273,7 +334,7 @@ export function resolveTargetAgent(preferredTerminal, preferredPane) {
         tab: a.tab || null,
         pane: a.pane || null,
         terminal: a.address,
-        label: `${a.program?.name || "Agent"} (${a.space_name})`,
+        label: formatAgentDisplayLabel(a, termMap, sharedSessions),
       };
     }
     const p = allPanes.find(x => x.terminal === preferredTerminal);
@@ -304,7 +365,9 @@ export function resolveTargetAgent(preferredTerminal, preferredPane) {
         tab: p.tab || a?.tab || null,
         pane: p.pane,
         terminal: p.terminal || a?.address || null,
-        label: p.title || a?.program?.name || "Agent",
+        label: a
+          ? formatAgentDisplayLabel(a, termMap, sharedSessions)
+          : p.title || "Agent",
       };
     }
   }
@@ -319,7 +382,7 @@ export function resolveTargetAgent(preferredTerminal, preferredPane) {
       pane: f.pane || a?.pane || null,
       terminal: term,
       label: a
-        ? `${a.program?.name || "Agent"} (${a.space_name})`
+        ? formatAgentDisplayLabel(a, termMap, sharedSessions)
         : p?.program?.name || p?.title || term || "Active Pane",
     };
   }
@@ -337,7 +400,7 @@ export function resolveTargetAgent(preferredTerminal, preferredPane) {
       tab: spaceAgent.tab || null,
       pane: spaceAgent.pane || null,
       terminal: spaceAgent.address,
-      label: `${spaceAgent.program?.name || "Agent"} (${spaceAgent.space_name})`,
+      label: formatAgentDisplayLabel(spaceAgent, termMap, sharedSessions),
     };
   }
 

@@ -1,6 +1,6 @@
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, Input, TextView } from "gpui-base";
-import { exec, readTextFile, writeTextFile, theme, settings } from "herdr";
+import { v_flex, h_flex, EditorState, Input, TextView, HoverCard } from "gpui-base";
+import { exec, readTextFile, writeTextFile, theme, settings, notify, window } from "herdr";
 import { getFileIcon, ICON_PREFIX } from "./icons.js";
 import {
   LANG,
@@ -41,8 +41,9 @@ const SYNTAX_TYPES = new Set([
 const TOKEN_RE =
   /(\/\/.*$|#.*$|--.*$|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b0x[0-9a-fA-F_]+\b|\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b|@[A-Za-z_][A-Za-z0-9_]*|\b[A-Za-z_$][A-Za-z0-9_$]*\b)/g;
 
-function tokenizeSyntaxLine(lineText, ext, t) {
+function tokenizeSyntaxLine(lineText, ext, t, enabled = true) {
   if (!lineText) return [{ start: 0, end: 0, color: t.foreground }];
+  if (!enabled) return [{ start: 0, end: lineText.length, color: t.foreground }];
   const trimmed = lineText.trimStart();
   const isHashCommentLang =
     ext === "py" || ext === "sh" || ext === "bash" || ext === "zsh" ||
@@ -126,12 +127,89 @@ function tokenizeSyntaxLine(lineText, ext, t) {
   return spans;
 }
 
+function parseRemoteCommitBaseUrl(rawUrl) {
+  if (!rawUrl) return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  let host = "";
+  let repoPath = "";
+  const sshMatch = /^(?:ssh:\/\/)?git@([^:/]+)[:/](.+?)(?:\.git)?$/i.exec(trimmed);
+  if (sshMatch) {
+    host = sshMatch[1];
+    repoPath = sshMatch[2];
+  } else {
+    const httpMatch = /^https?:\/\/(?:[^@]+@)?([^/]+)\/(.+?)(?:\.git)?$/i.exec(trimmed);
+    if (httpMatch) {
+      host = httpMatch[1];
+      repoPath = httpMatch[2];
+    }
+  }
+  if (!host || !repoPath) return null;
+  repoPath = repoPath.replace(/\/+$/, "");
+  if (host.includes("gitlab")) {
+    return `https://${host}/${repoPath}/-/commit`;
+  }
+  return `https://${host}/${repoPath}/commit`;
+}
+
+function parseDiffRows(lines) {
+  let old = 0;
+  let next = 0;
+  return lines.map(line => {
+    const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
+    if (match) {
+      old = +match[1];
+      next = +match[2];
+      return { kind: "@", text: line, targetLine: Math.max(1, next) };
+    }
+    const kind = line[0];
+    if (kind === "-") {
+      return {
+        kind,
+        number: old++,
+        targetLine: Math.max(1, next),
+        text: line.slice(1) || " ",
+      };
+    }
+    if (kind === "+") {
+      const ln = next++;
+      return { kind, number: ln, targetLine: ln, text: line.slice(1) || " " };
+    }
+    if (kind === " ") {
+      old++;
+      const ln = next++;
+      return { kind, number: ln, targetLine: ln, text: line.slice(1) || " " };
+    }
+    return { kind: "", text: line, targetLine: next > 0 ? next : null };
+  });
+}
+
+function computeSimpleMemoryDiff(oldText, newText) {
+  const oldLines = (oldText || "").replace(/\r\n/g, "\n").split("\n");
+  const newLines = (newText || "").replace(/\r\n/g, "\n").split("\n");
+  if (oldText === newText) return ["No uncommitted or unsaved changes"];
+  const maxLen = Math.max(oldLines.length, newLines.length);
+  const out = [`@@ -1,${oldLines.length} +1,${newLines.length} @@`];
+  for (let i = 0; i < Math.min(maxLen, 1200); i++) {
+    const o = oldLines[i];
+    const n = newLines[i];
+    if (o === n) {
+      if (o !== undefined) out.push(` ${o}`);
+    } else {
+      if (o !== undefined) out.push(`-${o}`);
+      if (n !== undefined) out.push(`+${n}`);
+    }
+  }
+  return out;
+}
+
 export const previewMethods = {
   openFileFind(cx, initialQuery) {
     if (!this.file) return;
     this.findOpen = true;
     this.rawEditor = false;
     this.mdPreview = false;
+    this.diffView = false;
     if (typeof initialQuery === "string" && initialQuery.length > 0) {
       this.findQuery = initialQuery;
       this.findInput.set_value(initialQuery);
@@ -146,6 +224,474 @@ export const previewMethods = {
     this.findFocused = false;
     this.handle.focus();
     cx.notify();
+  },
+
+  enterEditMode(lineNo, col, cx) {
+    if (!this.file || this.fileTruncated || !this.lines.length) return;
+    const ln = Math.max(1, Math.min(this.lines.length, lineNo || 1));
+    const lineText = this.lines[ln - 1] ?? "";
+    const targetCol = Math.max(0, Math.min(lineText.length, col ?? 0));
+    this.rawEditor = true;
+    this.mdPreview = false;
+    this.findOpen = false;
+    this.diffView = false;
+    this.moreMenuOpen = false;
+    this.contextMenu = null;
+    this.selectingLines = false;
+    this.selectingGutter = false;
+    this.editCursorLine = ln;
+    this.editCursorCol = targetCol;
+    this.editLineTyped = false;
+    this.selAnchor = { lineNo: ln, col: targetCol };
+    this.selFocus = { lineNo: ln, col: targetCol };
+    this.syncLineSelectionFromChar();
+    try {
+      this.editLineInput.set_value(lineText);
+      const utf8BytePos = encodeURIComponent(lineText.slice(0, targetCol)).replace(
+        /%[0-9A-F]{2}/g,
+        "_",
+      ).length;
+      this.editLineInput.set_selected_range({ start: utf8BytePos, end: utf8BytePos });
+      this.editLineInput.focus();
+    } catch {}
+    cx.notify();
+  },
+
+  exitEditMode(cx) {
+    if (!this.rawEditor) return;
+    this.rawEditor = false;
+    this.editInputFocused = false;
+    const ln = Math.max(1, Math.min(this.lines.length || 1, this.editCursorLine || 1));
+    const col = Math.max(
+      0,
+      Math.min((this.lines[ln - 1] || "").length, this.editCursorCol || 0),
+    );
+    this.selAnchor = { lineNo: ln, col };
+    this.selFocus = { lineNo: ln, col };
+    this.syncLineSelectionFromChar();
+    try {
+      this.handle.focus();
+    } catch {}
+    cx.notify();
+  },
+
+  moveEditLine(delta, cx) {
+    if (!this.rawEditor || !this.lines.length) return;
+    const nextLn = Math.max(
+      1,
+      Math.min(this.lines.length, (this.editCursorLine || 1) + delta),
+    );
+    if (nextLn === this.editCursorLine) return;
+    const nextText = this.lines[nextLn - 1] ?? "";
+    const nextCol = Math.min(nextText.length, this.editCursorCol ?? 0);
+    this.enterEditMode(nextLn, nextCol, cx);
+    this.ensureEditLineVisible(nextLn);
+    cx.notify();
+  },
+
+  ensureEditLineVisible(lineNo) {
+    const viewH = Math.max(120, this.linesViewHeight || 500);
+    const lineTop = (lineNo - 1) * LINE_H;
+    const lineBottom = lineTop + LINE_H;
+    if (lineTop < this.lineScroll) {
+      this.lineScroll = Math.max(0, lineTop - LINE_H);
+    } else if (lineBottom > this.lineScroll + viewH - LINE_H) {
+      const maxScroll = Math.max(0, this.lines.length * LINE_H - viewH + 8);
+      this.lineScroll = Math.min(maxScroll, lineBottom - viewH + LINE_H * 2);
+    }
+  },
+
+  splitEditLineAtCursor(cx) {
+    if (!this.rawEditor || !this.file || this.fileTruncated) return;
+    const idx = Math.max(0, Math.min(this.lines.length - 1, (this.editCursorLine || 1) - 1));
+    const curVal = this.editLineInput.value();
+    const indentMatch = /^(\s*)/.exec(curVal);
+    const indent = indentMatch ? indentMatch[1] : "";
+    this.lines[idx] = curVal;
+    this.lines.splice(idx + 1, 0, indent);
+    this.syncRawTextFromLines(cx);
+    this.enterEditMode(idx + 2, indent.length, cx);
+    this.ensureEditLineVisible(idx + 2);
+  },
+
+  mergeEditLineWithPrev(cx) {
+    if (!this.rawEditor || !this.file || this.fileTruncated) return;
+    const idx = Math.max(0, Math.min(this.lines.length - 1, (this.editCursorLine || 1) - 1));
+    if (idx <= 0) return;
+    const prevLine = this.lines[idx - 1] ?? "";
+    const curLine = this.lines[idx] ?? "";
+    const joinCol = prevLine.length;
+    this.lines[idx - 1] = prevLine + curLine;
+    this.lines.splice(idx, 1);
+    this.syncRawTextFromLines(cx);
+    this.enterEditMode(idx, joinCol, cx);
+    this.ensureEditLineVisible(idx);
+  },
+
+  syncRawTextFromLines(cx) {
+    if (!this.file || this.fileTruncated) return;
+    const nextVal = this.lines.join("\n");
+    this.rawText = nextVal;
+    try {
+      this.code?.set_value(nextVal);
+    } catch {}
+    const isDirty = this.diskText !== null && nextVal !== this.diskText;
+    this.fileDirty = isDirty;
+    if (isDirty) {
+      this.dirtyFiles.set(this.file, {
+        rawText: nextVal,
+        diskText: this.diskText,
+      });
+      if (this.autoSave) {
+        this.scheduleSaveEditedFile(this.file, nextVal, cx);
+      }
+    } else {
+      this.dirtyFiles.delete(this.file);
+    }
+    cx.notify();
+  },
+
+  formatCodeText(text) {
+    if (!text) return text;
+    return text
+      .split("\n")
+      .map(line => line.replace(/[ \t]+$/, ""))
+      .join("\n");
+  },
+
+  async saveCurrentFile(cx, silent = false) {
+    if (!this.file || !this.root || this.fileTruncated) return;
+    const path = this.file;
+    const root = this.root;
+    let nextVal = this.rawText;
+    if (this.formatOnSave) {
+      const formatted = this.formatCodeText(nextVal);
+      if (formatted !== nextVal) {
+        nextVal = formatted;
+        this.rawText = nextVal;
+        this.lines = nextVal.split("\n");
+        if (this.rawEditor) {
+          const idx = Math.max(
+            0,
+            Math.min(this.lines.length - 1, (this.editCursorLine || 1) - 1),
+          );
+          try {
+            this.editLineInput.set_value(this.lines[idx] ?? "");
+          } catch {}
+        }
+        try {
+          this.code?.set_value(nextVal);
+        } catch {}
+      }
+    }
+
+    try {
+      await writeTextFile(`${root}/${path}`, nextVal, this.diskText);
+      this.diskText = nextVal;
+    } catch {
+      try {
+        const latest = await readTextFile(`${root}/${path}`, { on: this.on });
+        await writeTextFile(`${root}/${path}`, nextVal, latest);
+        this.diskText = nextVal;
+      } catch (e) {
+        if (!silent) {
+          notify({
+            title: "Save Failed",
+            body: String(e?.message || e),
+            timeout: 2200,
+          });
+        }
+        return;
+      }
+    }
+
+    this.fileDirty = false;
+    this.dirtyFiles.delete(path);
+    if (!silent) {
+      notify({
+        title: "Saved",
+        body: path,
+        timeout: 1400,
+      });
+    }
+    if (this.gitBlame) {
+      this.loadGitBlame(path, cx);
+    }
+    if (this.diffView) {
+      this.loadFileDiff(path, cx);
+    }
+    this.refresh(cx);
+    cx.notify();
+  },
+
+  discardCurrentChanges(cx) {
+    if (!this.file || this.diskText == null) return;
+    const path = this.file;
+    const restored = this.diskText;
+    this.saveSeq = (this.saveSeq || 0) + 1;
+    this.rawText = restored;
+    this.lines = restored.replace(/\r\n/g, "\n").split("\n");
+    this.fileDirty = false;
+    this.dirtyFiles.delete(path);
+    try {
+      this.code?.set_value(restored);
+    } catch {}
+    if (this.rawEditor) {
+      const ln = Math.max(1, Math.min(this.lines.length || 1, this.editCursorLine || 1));
+      const lineText = this.lines[ln - 1] ?? "";
+      this.editCursorLine = ln;
+      this.editCursorCol = Math.min(lineText.length, this.editCursorCol || 0);
+      try {
+        this.editLineInput.set_value(lineText);
+      } catch {}
+    }
+    if (this.findOpen && this.findQuery) {
+      this.recomputeFileMatches(false);
+    }
+    if (this.diffView) {
+      this.loadFileDiff(path, cx);
+    }
+    notify({
+      title: "Changes Discarded",
+      body: `Reverted unsaved edits in ${path}`,
+      timeout: 1500,
+    });
+    cx.notify();
+  },
+
+  revealInFinder(path, cx) {
+    if (!path || !this.root) return;
+    const fullPath = `${this.root}/${path}`;
+    const on = this.on;
+    cx.spawn(async () => {
+      try {
+        const plat = window()?.platform;
+        if (!on && plat === "windows") {
+          await exec("explorer", ["/select,", fullPath.replace(/\//g, "\\")], { on });
+        } else if (!on && plat === "linux") {
+          const dir = fullPath.slice(0, Math.max(0, fullPath.lastIndexOf("/")));
+          await exec("xdg-open", [dir || fullPath], { on });
+        } else {
+          await exec("open", ["-R", fullPath], { on });
+        }
+      } catch {}
+    });
+  },
+
+  loadGitBlame(path, cx) {
+    if (!path || !this.root) return;
+    const root = this.root;
+    const on = this.on;
+    const slash = path.lastIndexOf("/");
+    const fileDir = slash >= 0 ? `${root}/${path.slice(0, slash)}` : root;
+    const fileName = slash >= 0 ? path.slice(slash + 1) : path;
+    this.blameLoading = true;
+    cx.spawn(async cx => {
+      try {
+        const [r, remoteRes] = await Promise.all([
+          exec(
+            "git",
+            [
+              "--no-optional-locks",
+              "blame",
+              "--line-porcelain",
+              "--",
+              fileName,
+            ],
+            { cwd: fileDir, on },
+          ).catch(() => null),
+          exec(
+            "git",
+            ["--no-optional-locks", "config", "--get", "remote.origin.url"],
+            { cwd: fileDir, on },
+          ).catch(() => null),
+        ]);
+        if (this.file !== path) return;
+        const commitBaseUrl =
+          remoteRes?.code === 0 ? parseRemoteCommitBaseUrl(remoteRes.stdout) : null;
+        const rawByLine = new Map();
+        if (r && r.code === 0 && r.stdout) {
+          let curLine = null;
+          let curAuthor = "";
+          let curMail = "";
+          let curTime = 0;
+          let curSummary = "";
+          let curHash = "";
+          let curFullHash = "";
+          for (const raw of r.stdout.split("\n")) {
+            const hdr = /^([0-9a-f]{7,40})\s+\d+\s+(\d+)/.exec(raw);
+            if (hdr) {
+              curFullHash = hdr[1];
+              curHash = hdr[1].slice(0, 8);
+              curLine = Number(hdr[2]);
+              curAuthor = "";
+              curMail = "";
+              curTime = 0;
+              curSummary = "";
+              continue;
+            }
+            if (raw.startsWith("author ")) {
+              curAuthor = raw.slice(7).trim();
+            } else if (raw.startsWith("author-mail ")) {
+              curMail = raw.slice(12).trim().replace(/^<|>$/g, "");
+            } else if (raw.startsWith("author-time ")) {
+              curTime = Number(raw.slice(12).trim()) || 0;
+            } else if (raw.startsWith("summary ")) {
+              curSummary = raw.slice(8).trim();
+            } else if (raw.startsWith("\t") && curLine != null) {
+              let dateStr = "";
+              let timeStr = "";
+              if (curTime > 0) {
+                const d = new Date(curTime * 1000);
+                const yyyy = d.getFullYear();
+                const mm = String(d.getMonth() + 1).padStart(2, "0");
+                const dd = String(d.getDate()).padStart(2, "0");
+                const hh = String(d.getHours()).padStart(2, "0");
+                const min = String(d.getMinutes()).padStart(2, "0");
+                dateStr = `${yyyy}-${mm}-${dd}`;
+                timeStr = `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+              }
+              const uncommitted = /^0+$/.test(curHash);
+              const shortLabel = uncommitted
+                ? "Uncommitted"
+                : `${curAuthor || "unknown"}${dateStr ? ` ${dateStr}` : ""}`;
+              rawByLine.set(curLine, {
+                hash: uncommitted ? "uncommitted" : curHash,
+                fullHash: uncommitted ? "00000000" : curFullHash,
+                commitUrl:
+                  !uncommitted && commitBaseUrl && curFullHash
+                    ? `${commitBaseUrl}/${curFullHash}`
+                    : null,
+                uncommitted,
+                author: curAuthor || "unknown",
+                mail: curMail,
+                dateStr,
+                timeStr,
+                summary: curSummary || (uncommitted ? "Not Committed Yet" : ""),
+                shortLabel,
+              });
+              curLine = null;
+            }
+          }
+        }
+        // Aggregate contiguous lines with the same commit hash into blocks
+        // with alternating grayscale shades, showing annotation only on the first line of each block.
+        const map = new Map();
+        const maxLn = Math.max(this.lines.length, rawByLine.size);
+        let prevHash = null;
+        let blockIdx = -1;
+        for (let ln = 1; ln <= maxLn; ln++) {
+          const entry = rawByLine.get(ln);
+          if (!entry) continue;
+          const isFirst = entry.hash !== prevHash;
+          if (isFirst) {
+            blockIdx++;
+            prevHash = entry.hash;
+          }
+          map.set(ln, {
+            ...entry,
+            isFirst,
+            shade: blockIdx % 2,
+          });
+        }
+        this.blameByLine = map;
+      } finally {
+        if (this.file === path) this.blameLoading = false;
+        cx.notify();
+      }
+    });
+  },
+
+  loadCommitDiff(hash, shortHash, path, cx) {
+    if (!hash || !this.root) return;
+    const root = this.root;
+    const on = this.on;
+    const slash = path ? path.lastIndexOf("/") : -1;
+    const fileDir = slash >= 0 ? `${root}/${path.slice(0, slash)}` : root;
+    const fileName = slash >= 0 ? path.slice(slash + 1) : path;
+    this.diffView = true;
+    this.rawEditor = false;
+    this.mdPreview = false;
+    this.diffLoading = true;
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const r = await exec(
+          "git",
+          [
+            "--no-optional-locks",
+            "show",
+            "--no-ext-diff",
+            "--no-color",
+            "--format=format:",
+            hash,
+            "--",
+            fileName,
+          ],
+          { cwd: fileDir, on },
+        ).catch(() => null);
+        if (this.file !== path) return;
+        if (r && r.code === 0 && r.stdout.trim()) {
+          const all = r.stdout.replace(/\n$/, "").split("\n");
+          const first = all.findIndex(l => l.startsWith("@@"));
+          const body = first >= 0 ? all.slice(first) : all;
+          this.diffRows = parseDiffRows([
+            `@@ Commit ${shortHash || hash.slice(0, 8)} @@`,
+            ...body.slice(0, 1500),
+          ]);
+        } else {
+          this.diffRows = parseDiffRows([`No diff found for commit ${shortHash || hash}`]);
+        }
+      } finally {
+        if (this.file === path) this.diffLoading = false;
+        cx.notify();
+      }
+    });
+  },
+
+  loadFileDiff(path, cx) {
+    if (!path || !this.root) return;
+    const root = this.root;
+    const on = this.on;
+    const slash = path.lastIndexOf("/");
+    const fileDir = slash >= 0 ? `${root}/${path.slice(0, slash)}` : root;
+    const fileName = slash >= 0 ? path.slice(slash + 1) : path;
+    this.diffLoading = true;
+    cx.spawn(async cx => {
+      try {
+        if (this.fileDirty && this.diskText != null) {
+          const memLines = computeSimpleMemoryDiff(this.diskText, this.rawText);
+          this.diffRows = parseDiffRows(memLines);
+          return;
+        }
+        const r = await exec(
+          "git",
+          [
+            "--no-optional-locks",
+            "diff",
+            "HEAD",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--",
+            fileName,
+          ],
+          { cwd: fileDir, on },
+        ).catch(() => null);
+        if (this.file !== path) return;
+        if (r && r.code === 0 && r.stdout.trim()) {
+          const all = r.stdout.replace(/\n$/, "").split("\n");
+          const first = all.findIndex(l => l.startsWith("@@"));
+          const body = first >= 0 ? all.slice(first) : all;
+          this.diffRows = parseDiffRows(body.slice(0, 1500));
+        } else {
+          this.diffRows = parseDiffRows(["No uncommitted or unsaved changes"]);
+        }
+      } finally {
+        if (this.file === path) this.diffLoading = false;
+        cx.notify();
+      }
+    });
   },
 
   scrollToLine(lineNo) {
@@ -391,6 +937,13 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
   },
 
   show(path, cx, jumpOpts = null) {
+    if (this.file && this.file !== path && this.fileDirty && this.diskText != null) {
+      this.dirtyFiles.set(this.file, {
+        rawText: this.rawText,
+        diskText: this.diskText,
+      });
+    }
+
     if (!jumpOpts?.fromHistory) {
       const curHist = this.history[this.historyIdx] ?? null;
       if (curHist !== (path ?? null)) {
@@ -407,6 +960,9 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     this.file = path;
     this.rawText = "";
     this.fileError = null;
+    this.fileDirty = false;
+    this.rawEditor = false;
+    this.moreMenuOpen = false;
     this.lines = [];
     this.lineScroll = 0;
     this.selStart = null;
@@ -418,8 +974,11 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     this.contextMenu = null;
     this.findMatches = [];
     this.findMatchesByLine = new Map();
+    this.blameByLine = new Map();
+    this.diffRows = [];
     if (!path) {
       this.findOpen = false;
+      this.diffView = false;
       this.persistFolders();
       return;
     }
@@ -469,11 +1028,16 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
           return;
         }
         const truncated = text.length > 400000;
-        const clipped =
-          truncated ? text.slice(0, 400000) + "\n… (file truncated)" : text;
+        const savedDirty = !truncated ? this.dirtyFiles?.get(path) : null;
+        const clipped = savedDirty
+          ? savedDirty.rawText
+          : truncated
+            ? text.slice(0, 400000) + "\n… (file truncated)"
+            : text;
         this.rawText = clipped;
         this.diskText = truncated ? null : text;
         this.fileTruncated = truncated;
+        this.fileDirty = Boolean(savedDirty && savedDirty.rawText !== text);
         this.lines = clipped.replace(/\r\n/g, "\n").split("\n");
         const t = theme();
         const ext = path.includes(".") ? path.split(".").pop() : "txt";
@@ -483,6 +1047,8 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
             language: LANG[this.fileExt] ?? this.fileExt,
             readonly: truncated,
             value: clipped,
+            line_numbers: this.showLineNumbers !== false,
+            soft_wrap: Boolean(this.wordWrap),
             font_family: settings().font_family,
             font_size: 12,
             syntax: {
@@ -501,7 +1067,20 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
             if (nextVal === this.rawText) return;
             this.rawText = nextVal;
             this.lines = nextVal.replace(/\r\n/g, "\n").split("\n");
-            this.scheduleSaveEditedFile(path, nextVal, cx);
+            const isDirty = this.diskText !== null && nextVal !== this.diskText;
+            this.fileDirty = isDirty;
+            if (isDirty) {
+              this.dirtyFiles.set(path, {
+                rawText: nextVal,
+                diskText: this.diskText,
+              });
+              if (this.autoSave) {
+                this.scheduleSaveEditedFile(path, nextVal, cx);
+              }
+            } else {
+              this.dirtyFiles.delete(path);
+            }
+            cx.notify();
           });
         } catch {}
         if ((this.findOpen || jumpOpts?.query) && this.findQuery) {
@@ -522,6 +1101,12 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
           this.pendingScrollLine = ln;
           this.scrollToLine(ln);
         }
+        if (this.gitBlame) {
+          this.loadGitBlame(path, cx);
+        }
+        if (this.diffView) {
+          this.loadFileDiff(path, cx);
+        }
       } catch {
         if (this.file === path) {
           this.fileError = "Cannot preview this file (binary, too large, or unreadable)";
@@ -535,21 +1120,10 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
   scheduleSaveEditedFile(path, nextVal, cx) {
     this.saveSeq = (this.saveSeq || 0) + 1;
     const seq = this.saveSeq;
-    const root = this.root;
     cx.spawn(async cx => {
-      await cx.sleep(300);
-      if (this.saveSeq !== seq || this.file !== path || !root) return;
-      try {
-        await writeTextFile(`${root}/${path}`, nextVal, this.diskText);
-        this.diskText = nextVal;
-      } catch {
-        try {
-          const latest = await readTextFile(`${root}/${path}`, { on: this.on });
-          await writeTextFile(`${root}/${path}`, nextVal, latest);
-          this.diskText = nextVal;
-        } catch {}
-      }
-      cx.notify();
+      await cx.sleep(350);
+      if (this.saveSeq !== seq || this.file !== path || !this.root) return;
+      await this.saveCurrentFile(cx, true);
     });
   },
 
@@ -606,7 +1180,8 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
 
   colFromLocalX(lineText, localX) {
     if (!lineText) return 0;
-    const textX = Math.max(0, (localX ?? 54) - 54);
+    const gutterOffset = this.showLineNumbers === false ? 8 : 54;
+    const textX = Math.max(0, (localX ?? gutterOffset) - gutterOffset);
     let acc = 0;
     for (let i = 0; i < lineText.length; i++) {
       const code = lineText.charCodeAt(i);
@@ -811,7 +1386,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
         );
     }
     const ext = this.fileExt || "txt";
-    const syntaxSpans = tokenizeSyntaxLine(lineText, ext, t);
+    const syntaxSpans = tokenizeSyntaxLine(lineText, ext, t, this.lspEnabled !== false);
     const selStart = selCols ? selCols[0] : -1;
     const selEnd = selCols ? selCols[1] : -1;
     const hasSel = selStart >= 0 && selEnd > selStart;
@@ -912,27 +1487,393 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     return h_flex().flex_1().min_w(0).overflow_hidden().items_center().children(segments);
   },
 
-  renderLinesView(t) {
-    const normSel = this.normalizedCharSelection();
-    const totalLines = this.lines.length;
+  renderBlameBlock(blockId, topPx, heightPx, blameInfo, isDark, t) {
+    const shadeBg = blameInfo
+      ? blameInfo.shade === 0
+        ? isDark
+          ? "#ffffff12"
+          : "#0000000d"
+        : isDark
+          ? "#ffffff05"
+          : "#00000004"
+      : null;
+    const barColor = blameInfo
+      ? blameInfo.shade === 0
+        ? isDark
+          ? "#ffffff42"
+          : "#00000038"
+        : isDark
+          ? "#ffffff1c"
+          : "#00000018"
+      : null;
+
+    const showLabel = Boolean(blameInfo && blameInfo.showHeader);
+    const isBlockStart = Boolean(blameInfo && blameInfo.isFirst && blameInfo.startLineNo > 1);
+    const blockBox = h_flex()
+      .w(148)
+      .h_full()
+      .pr(8)
+      .items_start()
+      .when(Boolean(shadeBg), el => el.bg(shadeBg))
+      .when(isBlockStart, el =>
+        el.border_t(1).border_color(isDark ? "#ffffff1a" : "#00000016"),
+      )
+      .border_r(1)
+      .border_color(isDark ? "#ffffff12" : "#00000010")
+      .child(
+        div()
+          .w(3)
+          .h_full()
+          .mr(6)
+          .flex_none()
+          .when(Boolean(barColor), el => el.bg(barColor)),
+      )
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .h(LINE_H)
+          .items_center()
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11)
+              .text_color(t.dim)
+              .child(showLabel ? blameInfo.shortLabel : ""),
+          ),
+      );
+
+    const inner = blameInfo
+      ? HoverCard.new(`blame-hc-${blockId}`)
+          .open_delay(180)
+          .close_delay(140)
+          .anchor("top_left")
+          .trigger(blockBox)
+          .content(
+            v_flex()
+              .w(280)
+              .p(10)
+              .gap(4)
+              .rounded(8)
+              .bg(t.popover)
+              .border_1()
+              .border_color(t.border)
+              .shadow_md()
+              .text_size(11.5)
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    div()
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .truncate()
+                      .child(
+                        blameInfo.uncommitted
+                          ? "Uncommitted Changes"
+                          : `${blameInfo.author}${blameInfo.mail ? ` <${blameInfo.mail}>` : ""}`,
+                      ),
+                  ),
+              )
+              .when(Boolean(blameInfo.timeStr || !blameInfo.uncommitted), el =>
+                el.child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .child(
+                      div()
+                        .id(`blame-hash-link-${blockId}`)
+                        .px(3)
+                        .py(0.5)
+                        .rounded(3)
+                        .cursor_pointer()
+                        .text_color(t.accent)
+                        .border_b(1)
+                        .border_color(t.accent)
+                        .hover(s => s.bg(t.hover))
+                        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                        .on_click((e, cx) => {
+                          cx.stop_propagation();
+                          if (blameInfo.uncommitted) return;
+                          cx.write_to_clipboard(blameInfo.fullHash || blameInfo.hash);
+                          if (blameInfo.commitUrl && !e.modifiers?.alt) {
+                            try {
+                              cx.open_url(blameInfo.commitUrl);
+                            } catch {}
+                            notify({
+                              title: "Opened Commit & Copied Hash",
+                              body: `${blameInfo.hash} → ${blameInfo.commitUrl}`,
+                              timeout: 1600,
+                            });
+                          } else {
+                            this.loadCommitDiff(
+                              blameInfo.fullHash || blameInfo.hash,
+                              blameInfo.hash,
+                              this.file,
+                              cx,
+                            );
+                            notify({
+                              title: "Showing Commit Diff",
+                              body: `Commit ${blameInfo.hash} (hash copied)`,
+                              timeout: 1500,
+                            });
+                          }
+                        })
+                        .child(blameInfo.hash),
+                    )
+                    .when(Boolean(blameInfo.timeStr), row =>
+                      row.child(div().child(`· ${blameInfo.timeStr}`)),
+                    ),
+                ),
+              )
+              .when(Boolean(blameInfo.summary), el =>
+                el
+                  .child(div().my(2).h(1).bg(t.border))
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(t.muted)
+                      .child(blameInfo.summary),
+                  ),
+              ),
+          )
+      : blockBox;
+
+    return div()
+      .id(`blame-block-wrap-${blockId}`)
+      .absolute()
+      .left(0)
+      .w(148)
+      .top(topPx)
+      .h(heightPx)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(inner);
+  },
+
+  renderInlineDiffView(t) {
+    const rows = this.diffRows || [];
+    const totalRows = rows.length;
     const font = settings().font_family ?? "JetBrains Mono";
     const viewH = Math.max(120, this.linesViewHeight || 500);
-    const totalH = Math.max(viewH, totalLines * LINE_H + 8);
-    const maxScroll = Math.max(0, totalLines * LINE_H - viewH + 8);
-    this.lineScroll = Math.max(0, Math.min(this.lineScroll, maxScroll));
+    const maxScroll = Math.max(0, totalRows * LINE_H - viewH + 8);
+    this.lineScroll = Math.max(0, Math.min(this.lineScroll || 0, maxScroll));
 
     const startIdx = Math.max(0, Math.floor(this.lineScroll / LINE_H) - 3);
     const endIdx = Math.min(
-      totalLines,
+      totalRows,
       Math.ceil((this.lineScroll + viewH) / LINE_H) + 3,
     );
 
     const visibleRows = [];
     for (let idx = startIdx; idx < endIdx; idx++) {
-      const lineNo = idx + 1;
-      const lineText = this.lines[idx] ?? "";
+      const row = rows[idx];
+      if (!row) continue;
+      const topPx = idx * LINE_H - this.lineScroll + 4;
+      const { kind, number, targetLine, text } = row;
+      if (kind === "@") {
+        visibleRows.push(
+          h_flex()
+            .id(`file-diff-row-${idx}`)
+            .absolute()
+            .left(0)
+            .right(10)
+            .top(topPx)
+            .h(LINE_H)
+            .px(12)
+            .items_center()
+            .bg(t.raised)
+            .text_color(t.dim)
+            .child(div().w_full().truncate().child(text)),
+        );
+      } else {
+        visibleRows.push(
+          h_flex()
+            .id(`file-diff-row-${idx}`)
+            .absolute()
+            .left(0)
+            .right(10)
+            .top(topPx)
+            .h(LINE_H)
+            .pr(8)
+            .gap(6)
+            .items_center()
+            .cursor_pointer()
+            .when(kind === "+", e => e.bg(t.ansi2 + "18"))
+            .when(kind === "-", e => e.bg(t.ansi1 + "18"))
+            .hover(s =>
+              s.bg(
+                kind === "+"
+                  ? t.ansi2 + "2c"
+                  : kind === "-"
+                    ? t.ansi1 + "2c"
+                    : t.hover,
+              ),
+            )
+            .on_mouse_down("left", (e, cx) => {
+              if (e.click_count >= 2 && targetLine) {
+                cx.stop_propagation();
+                this.diffView = false;
+                this.enterEditMode(targetLine, 0, cx);
+                this.scrollToLine(targetLine);
+              }
+            })
+            .when(this.showLineNumbers !== false, rEl =>
+              rEl.child(
+                div()
+                  .w(36)
+                  .flex_none()
+                  .text_right()
+                  .text_color(kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : t.dim)
+                  .child(number === undefined ? "" : String(number)),
+              ),
+            )
+            .child(
+              div()
+                .w(12)
+                .flex_none()
+                .text_center()
+                .text_color(kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : t.dim)
+                .child(kind === "+" || kind === "-" ? kind : " "),
+            )
+            .child(div().flex_1().min_w(0).truncate().child(text)),
+        );
+      }
+    }
+
+    return div()
+      .id("files-diff-scroll")
+      .relative()
+      .flex_1()
+      .min_h(0)
+      .overflow_hidden()
+      .font_family(font)
+      .text_size(12)
+      .on_size_change((size, cx) => {
+        if (size.height > 0 && Math.abs((this.linesViewHeight || 0) - size.height) > 1) {
+          this.linesViewHeight = size.height;
+          cx.notify();
+        }
+      })
+      .on_scroll_wheel((e, cx) => {
+        if (maxScroll <= 0) return;
+        this.lineScroll = Math.max(0, Math.min(maxScroll, this.lineScroll - e.delta.y));
+        cx.notify();
+      })
+      .children(visibleRows);
+  },
+
+  renderLinesView(t) {
+    const normSel = this.normalizedCharSelection();
+    const totalLines = this.lines.length;
+    const font = settings().font_family ?? "JetBrains Mono";
+    const viewH = Math.max(120, this.linesViewHeight || 500);
+    const panelW = Math.max(260, (this.panelSize?.width || 680) - (this.rightSidebarCollapsed ? 0 : 260));
+    const gutterW = (this.gitBlame ? 148 : 0) + (this.showLineNumbers === false ? 8 : 54);
+    const charsPerRow = this.wordWrap
+      ? Math.max(24, Math.floor((panelW - gutterW - 28) / 7.22))
+      : 0;
+
+    // Build visual rows (supporting optional soft wordWrap)
+    let visualRows = null;
+    let totalVisualRows = totalLines;
+    if (this.wordWrap && !this.rawEditor && charsPerRow > 0) {
+      visualRows = [];
+      for (let i = 0; i < totalLines; i++) {
+        const full = this.lines[i] ?? "";
+        if (full.length <= charsPerRow) {
+          visualRows.push({ lineNo: i + 1, subIdx: 0, text: full, colOffset: 0, fullText: full });
+        } else {
+          let pos = 0;
+          let sub = 0;
+          while (pos < full.length) {
+            const slice = full.slice(pos, pos + charsPerRow);
+            visualRows.push({
+              lineNo: i + 1,
+              subIdx: sub++,
+              text: slice,
+              colOffset: pos,
+              fullText: full,
+            });
+            pos += charsPerRow;
+          }
+        }
+      }
+      totalVisualRows = visualRows.length;
+    }
+
+    const totalH = Math.max(viewH, totalVisualRows * LINE_H + 8);
+    const maxScroll = Math.max(0, totalVisualRows * LINE_H - viewH + 8);
+    this.lineScroll = Math.max(0, Math.min(this.lineScroll, maxScroll));
+
+    const startIdx = Math.max(0, Math.floor(this.lineScroll / LINE_H) - 3);
+    const endIdx = Math.min(
+      totalVisualRows,
+      Math.ceil((this.lineScroll + viewH) / LINE_H) + 3,
+    );
+
+    const isDark = settings().dark !== false;
+    const blameW = this.gitBlame ? 148 : 0;
+    const visibleBlameBlocks = [];
+    if (this.gitBlame) {
+      let idx = startIdx;
+      while (idx < endIdx) {
+        const vRow = visualRows ? visualRows[idx] : null;
+        const lineNo = vRow ? vRow.lineNo : idx + 1;
+        const subIdx = vRow ? vRow.subIdx : 0;
+        const blameInfo = this.blameByLine?.get(lineNo) || null;
+        const curHash = blameInfo?.hash ?? null;
+        let runEnd = idx + 1;
+        while (runEnd < endIdx) {
+          const nextVRow = visualRows ? visualRows[runEnd] : null;
+          const nextLineNo = nextVRow ? nextVRow.lineNo : runEnd + 1;
+          const nextBlame = this.blameByLine?.get(nextLineNo) || null;
+          if ((nextBlame?.hash ?? null) !== curHash) break;
+          runEnd++;
+        }
+        const topPx = idx * LINE_H - this.lineScroll + 4;
+        const heightPx = (runEnd - idx) * LINE_H;
+        const blockMeta = blameInfo
+          ? {
+              ...blameInfo,
+              startLineNo: lineNo,
+              showHeader: Boolean(blameInfo.isFirst && subIdx === 0),
+            }
+          : null;
+        visibleBlameBlocks.push(
+          this.renderBlameBlock(
+            `${lineNo}-${subIdx}`,
+            topPx,
+            heightPx,
+            blockMeta,
+            isDark,
+            t,
+          ),
+        );
+        idx = runEnd;
+      }
+    }
+
+    const visibleRows = [];
+    for (let idx = startIdx; idx < endIdx; idx++) {
+      const vRow = visualRows ? visualRows[idx] : null;
+      const lineNo = vRow ? vRow.lineNo : idx + 1;
+      const subIdx = vRow ? vRow.subIdx : 0;
+      const colOffset = vRow ? vRow.colOffset : 0;
+      const lineText = vRow ? vRow.text : (this.lines[idx] ?? "");
+      const fullLineText = vRow ? vRow.fullText : lineText;
+      const isEditingLine = Boolean(
+        this.rawEditor && !this.findOpen && this.editCursorLine === lineNo && subIdx === 0,
+      );
+
       const hasLineSel = Boolean(
-        normSel &&
+        !this.rawEditor &&
+          normSel &&
           !normSel.empty &&
           lineNo >= normSel.start.lineNo &&
           lineNo <= normSel.end.lineNo,
@@ -940,47 +1881,69 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       let selCols = null;
       let highlightBreak = false;
       if (hasLineSel) {
-        const sc = lineNo === normSel.start.lineNo ? normSel.start.col : 0;
-        const ec = lineNo === normSel.end.lineNo ? normSel.end.col : lineText.length;
+        const scFull = lineNo === normSel.start.lineNo ? normSel.start.col : 0;
+        const ecFull = lineNo === normSel.end.lineNo ? normSel.end.col : fullLineText.length;
+        const sc = Math.max(0, scFull - colOffset);
+        const ec = Math.min(lineText.length, ecFull - colOffset);
         if (sc < ec) selCols = [sc, ec];
-        if (lineNo < normSel.end.lineNo) highlightBreak = true;
+        if (lineNo < normSel.end.lineNo && colOffset + lineText.length >= fullLineText.length) {
+          highlightBreak = true;
+        }
       }
-      const lineMatches = this.findMatchesByLine.get(lineNo);
+      const lineMatches = subIdx === 0 ? this.findMatchesByLine.get(lineNo) : null;
       const hasActiveMatch = Boolean(lineMatches?.some(m => m.globalIdx === this.findActiveIdx));
 
       visibleRows.push(
         h_flex()
-          .id(`line-${lineNo}`)
+          .id(`line-${lineNo}-${subIdx}`)
           .absolute()
-          .left(0)
+          .left(blameW)
           .right(10)
           .top(idx * LINE_H - this.lineScroll + 4)
           .h(LINE_H)
           .px(8)
-          .gap(10)
+          .gap(this.showLineNumbers === false ? 0 : 10)
           .items_center()
           .cursor_text()
-          .when(hasActiveMatch, el => el.bg("#e2b06122"))
+          .when(isEditingLine, el => el.bg(t.selected))
+          .when(!isEditingLine && hasActiveMatch, el => el.bg("#e2b06122"))
           .on_mouse_down("left", (e, cx) => {
             cx.stop_propagation();
             this.contextMenu = null;
-            this.handle.focus();
-            const localX = e.local_position?.x ?? 54;
-            const inGutter = localX < 49;
-            const col = inGutter ? 0 : this.colFromLocalX(lineText, localX);
+            this.moreMenuOpen = false;
+            const localX = e.local_position?.x ?? (this.showLineNumbers === false ? 8 : 54);
+            const inGutter = this.showLineNumbers !== false && localX < 49;
+            const colInSlice = inGutter ? 0 : this.colFromLocalX(lineText, localX);
+            const col = Math.min(fullLineText.length, colOffset + colInSlice);
 
+            if (this.rawEditor) {
+              if (!isEditingLine || !inGutter) {
+                this.enterEditMode(lineNo, col, cx);
+              }
+              return;
+            }
+
+            const now = Date.now();
+            const isDouble =
+              !inGutter &&
+              (e.click_count === 2 ||
+                (this.lastContentClick &&
+                  this.lastContentClick.lineNo === lineNo &&
+                  Math.abs(this.lastContentClick.col - col) <= 2 &&
+                  now - this.lastContentClick.ts < 360));
+            this.lastContentClick = { lineNo, col, ts: isDouble ? 0 : now };
+
+            if (isDouble && !this.fileTruncated) {
+              this.enterEditMode(lineNo, col, cx);
+              return;
+            }
+
+            this.handle.focus();
             if (e.click_count >= 3 || inGutter) {
               this.selAnchor = { lineNo, col: 0 };
-              this.selFocus = { lineNo, col: lineText.length };
+              this.selFocus = { lineNo, col: fullLineText.length };
               this.selectingLines = inGutter;
               this.selectingGutter = inGutter;
-              this.syncLineSelectionFromChar();
-            } else if (e.click_count === 2) {
-              const [ws, we] = this.wordBoundsAt(lineText, col);
-              this.selAnchor = { lineNo, col: ws };
-              this.selFocus = { lineNo, col: we };
-              this.selectingLines = false;
-              this.selectingGutter = false;
               this.syncLineSelectionFromChar();
             } else if (e.modifiers?.shift && this.selAnchor) {
               this.selFocus = { lineNo, col };
@@ -997,13 +1960,13 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
             cx.notify();
           })
           .on_mouse_move((e, cx) => {
-            if (!this.selectingLines) return;
-            const localX = e.local_position?.x ?? 54;
+            if (!this.selectingLines || this.rawEditor) return;
+            const localX = e.local_position?.x ?? (this.showLineNumbers === false ? 8 : 54);
             if (this.selectingGutter) {
               const anchorLine = this.selAnchor?.lineNo ?? lineNo;
               if (lineNo >= anchorLine) {
                 this.selAnchor = { lineNo: anchorLine, col: 0 };
-                this.selFocus = { lineNo, col: lineText.length };
+                this.selFocus = { lineNo, col: fullLineText.length };
               } else {
                 const anchorLen = (this.lines[anchorLine - 1] || "").length;
                 this.selAnchor = { lineNo: anchorLine, col: anchorLen };
@@ -1013,7 +1976,10 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
               cx.notify();
               return;
             }
-            const col = this.colFromLocalX(lineText, localX);
+            const col = Math.min(
+              fullLineText.length,
+              colOffset + this.colFromLocalX(lineText, localX),
+            );
             if (this.selFocus?.lineNo !== lineNo || this.selFocus?.col !== col) {
               this.selFocus = { lineNo, col };
               this.syncLineSelectionFromChar();
@@ -1029,29 +1995,57 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
           .on_mouse_down("right", () => {
             this.pendingMenu = this.buildLineMenuItems(lineNo);
           })
-          .child(
-            div()
-              .w(36)
-              .flex_none()
-              .text_right()
-              .cursor_pointer()
-              .text_color(hasActiveMatch ? "#e2b061" : hasLineSel ? t.accent : t.dim)
-              .child(String(lineNo)),
+          .when(this.showLineNumbers !== false, rowEl =>
+            rowEl.child(
+              div()
+                .w(36)
+                .flex_none()
+                .text_right()
+                .cursor_pointer()
+                .text_color(
+                  isEditingLine
+                    ? t.accent
+                    : hasActiveMatch
+                      ? "#e2b061"
+                      : hasLineSel
+                        ? t.accent
+                        : t.dim,
+                )
+                .child(subIdx === 0 ? String(lineNo) : "·"),
+            ),
           )
           .child(
-            this.renderLineContentWithMatches(
-              lineText,
-              lineMatches,
-              selCols,
-              highlightBreak,
-              t,
-            ),
+            isEditingLine
+              ? h_flex()
+                  .id(`edit-line-box-${lineNo}`)
+                  .flex_1()
+                  .min_w(0)
+                  .h_full()
+                  .items_center()
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .child(
+                    Input.new(this.editLineInput)
+                      .flex_1()
+                      .h_full()
+                      .font_family(font)
+                      .text_size(12)
+                      .text_color(t.foreground),
+                  )
+              : this.renderLineContentWithMatches(
+                  lineText,
+                  lineMatches,
+                  selCols,
+                  highlightBreak,
+                  t,
+                ),
           ),
       );
     }
 
     const thumbH =
-      totalLines * LINE_H > viewH ? Math.max(24, Math.round((viewH / totalH) * viewH)) : 0;
+      totalVisualRows * LINE_H > viewH
+        ? Math.max(24, Math.round((viewH / totalH) * viewH))
+        : 0;
     const thumbTop =
       maxScroll > 0 && thumbH > 0
         ? Math.round((this.lineScroll / maxScroll) * (viewH - thumbH))
@@ -1114,6 +2108,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
           cx.notify();
         }
       })
+      .children(visibleBlameBlocks)
       .children(visibleRows)
       .child(
         div()
@@ -1452,15 +2447,280 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       );
     }
     crumbs.push(
-      div()
+      h_flex()
         .flex_1()
         .min_w(0)
-        .truncate()
-        .text_size(12.5)
-        .text_color(t.foreground)
-        .child(fileName),
+        .items_center()
+        .child(
+          div()
+            .min_w(0)
+            .truncate()
+            .text_size(12.5)
+            .text_color(t.foreground)
+            .child(fileName),
+        )
+        .when(this.fileDirty, el =>
+          el.child(
+            div()
+              .id("files-dirty-indicator")
+              .flex_none()
+              .ml(1.5)
+              .mt(-4)
+              .text_size(12)
+              .font_bold()
+              .text_color("#e2b061")
+              .tooltip("Unsaved changes (⌘S to save)")
+              .child("*"),
+          ),
+        ),
     );
     return h_flex().flex_1().min_w(0).items_center().overflow_hidden().children(crumbs);
+  },
+
+  renderMoreMenuActionRow(t, id, label, shortcut, enabled, onClick) {
+    return h_flex()
+      .id(id)
+      .h(28)
+      .mx(5)
+      .px(9)
+      .rounded(6)
+      .items_center()
+      .justify_between()
+      .when(enabled, el =>
+        el
+          .cursor_pointer()
+          .text_color(t.foreground)
+          .hover(s => s.bg(t.hover)),
+      )
+      .when(!enabled, el => el.text_color(t.dim).opacity(0.5))
+      .on_click((e, cx) => {
+        cx.stop_propagation();
+        if (!enabled) return;
+        this.moreMenuOpen = false;
+        onClick(e, cx);
+      })
+      .child(div().text_size(12.5).child(label))
+      .when(Boolean(shortcut), el =>
+        el.child(div().text_size(11.5).text_color(t.dim).child(shortcut)),
+      );
+  },
+
+  renderMoreMenuToggleRow(t, id, label, checked, onToggle) {
+    return h_flex()
+      .id(id)
+      .h(28)
+      .mx(5)
+      .px(9)
+      .rounded(6)
+      .items_center()
+      .justify_between()
+      .cursor_pointer()
+      .text_color(t.foreground)
+      .hover(s => s.bg(t.hover))
+      .on_click((e, cx) => {
+        cx.stop_propagation();
+        onToggle(e, cx);
+      })
+      .child(div().text_size(12.5).child(label))
+      .child(
+        div()
+          .w(30)
+          .h(17)
+          .p(2)
+          .rounded(9)
+          .flex_none()
+          .flex()
+          .items_center()
+          .when(checked, el => el.bg("#3ea868").justify_end())
+          .when(!checked, el => el.bg(t.raised).border_1().border_color(t.border))
+          .child(div().size(13).rounded(7).bg("#ffffff")),
+      );
+  },
+
+  renderMoreMenuOverlay(t) {
+    if (!this.moreMenuOpen || !this.file) return null;
+    const rightOffset = !this.rightSidebarCollapsed ? 268 : 8;
+
+    return div()
+      .id("files-more-menu-backdrop")
+      .absolute()
+      .inset_0()
+      .on_mouse_down("left", (_e, cx) => {
+        cx.stop_propagation();
+        this.moreMenuOpen = false;
+        cx.notify();
+      })
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        this.moreMenuOpen = false;
+        cx.notify();
+      })
+      .child(
+        v_flex()
+          .id("files-more-menu-popup")
+          .absolute()
+          .top(38)
+          .right(rightOffset)
+          .w(218)
+          .py(6)
+          .gap(1)
+          .rounded(10)
+          .bg(t.popover)
+          .border_1()
+          .border_color(t.border)
+          .shadow_md()
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
+          .child(
+            this.renderMoreMenuActionRow(
+              t,
+              "more-save-file",
+              "Save File",
+              "⌘S",
+              Boolean(this.file && !this.fileTruncated),
+              (_e, cx) => this.saveCurrentFile(cx),
+            ),
+          )
+          .child(
+            this.renderMoreMenuActionRow(
+              t,
+              "more-discard-changes",
+              "Discard Changes",
+              "",
+              Boolean(this.fileDirty),
+              (_e, cx) => this.discardCurrentChanges(cx),
+            ),
+          )
+          .child(div().mx(10).my(4).h(1).bg(t.border))
+          .child(
+            this.renderMoreMenuActionRow(
+              t,
+              "more-reveal-finder",
+              "Reveal in Finder",
+              "",
+              Boolean(this.file),
+              (_e, cx) => this.revealInFinder(this.file, cx),
+            ),
+          )
+          .child(
+            this.renderMoreMenuActionRow(
+              t,
+              "more-copy-rel-path",
+              "Copy Relative Path",
+              "",
+              Boolean(this.file),
+              (_e, cx) => {
+                cx.write_to_clipboard(this.file);
+                notify({ title: "Copied", body: this.file, timeout: 1400 });
+                cx.notify();
+              },
+            ),
+          )
+          .child(div().mx(10).my(4).h(1).bg(t.border))
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-diff",
+              "Diff View",
+              Boolean(this.diffView),
+              (_e, cx) => {
+                this.diffView = !this.diffView;
+                if (this.diffView) {
+                  this.rawEditor = false;
+                  this.mdPreview = false;
+                  this.loadFileDiff(this.file, cx);
+                }
+                cx.notify();
+              },
+            ),
+          )
+          .child(div().mx(10).my(4).h(1).bg(t.border))
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-lsp",
+              "LSP",
+              this.lspEnabled !== false,
+              (_e, cx) => {
+                this.lspEnabled = this.lspEnabled === false;
+                this.persistPrefs?.();
+                cx.notify();
+              },
+            ),
+          )
+          .child(div().mx(10).my(4).h(1).bg(t.border))
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-line-numbers",
+              "Line Numbers",
+              this.showLineNumbers !== false,
+              (_e, cx) => {
+                this.showLineNumbers = this.showLineNumbers === false;
+                this.persistPrefs?.();
+                cx.notify();
+              },
+            ),
+          )
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-word-wrap",
+              "Word Wrap",
+              Boolean(this.wordWrap),
+              (_e, cx) => {
+                this.wordWrap = !this.wordWrap;
+                this.persistPrefs?.();
+                cx.notify();
+              },
+            ),
+          )
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-git-blame",
+              "Git Blame",
+              Boolean(this.gitBlame),
+              (_e, cx) => {
+                this.gitBlame = !this.gitBlame;
+                this.persistPrefs?.();
+                if (this.gitBlame && this.file) {
+                  this.loadGitBlame(this.file, cx);
+                }
+                cx.notify();
+              },
+            ),
+          )
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-auto-save",
+              "Auto Save",
+              Boolean(this.autoSave),
+              (_e, cx) => {
+                this.autoSave = !this.autoSave;
+                this.persistPrefs?.();
+                if (this.autoSave && this.fileDirty && this.file) {
+                  this.saveCurrentFile(cx, true);
+                }
+                cx.notify();
+              },
+            ),
+          )
+          .child(
+            this.renderMoreMenuToggleRow(
+              t,
+              "more-toggle-format-on-save",
+              "Format on Save",
+              Boolean(this.formatOnSave),
+              (_e, cx) => {
+                this.formatOnSave = !this.formatOnSave;
+                this.persistPrefs?.();
+                cx.notify();
+              },
+            ),
+          ),
+      );
   },
 
   renderUnifiedTopBar(t, range, activeRef) {
@@ -1550,6 +2810,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                     .text_size(11.5)
                     .on_click((_e, cx) => {
                       this.mdPreview = true;
+                      this.rawEditor = false;
                       this.findOpen = false;
                       cx.notify();
                     })
@@ -1578,6 +2839,20 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                     .child("Source"),
                 ),
             )
+            .child(
+              this.headerIconButton(
+                t,
+                "files-more-menu-btn",
+                "ellipsis",
+                "Editor Actions & Settings (...)",
+                (_e, cx) => {
+                  this.moreMenuOpen = !this.moreMenuOpen;
+                  this.contextMenu = null;
+                  cx.notify();
+                },
+                this.moreMenuOpen,
+              ),
+            )
             .when(!isMd || !this.mdPreview, row =>
               row.child(
                 this.headerIconButton(
@@ -1585,14 +2860,16 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                   "files-mode-toggle",
                   this.rawEditor ? "edit" : "eye",
                   this.rawEditor
-                    ? "编辑模式 (点击切换为只读模式)"
-                    : "只读模式 (点击切换为编辑模式)",
+                    ? "编辑模式 (Esc 或点击返回只读模式)"
+                    : "只读模式 (双击内容或点击进入编辑模式)",
                   (_e, cx) => {
-                    this.rawEditor = !this.rawEditor;
                     if (this.rawEditor) {
-                      this.findOpen = false;
+                      this.exitEditMode(cx);
+                    } else {
+                      const startLn = this.selAnchor?.lineNo || 1;
+                      const startCol = this.selAnchor?.col || 0;
+                      this.enterEditMode(startLn, startCol, cx);
                     }
-                    cx.notify();
                   },
                   this.rawEditor,
                 ),
@@ -1656,21 +2933,27 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       .when(this.findOpen, sub => sub.child(this.renderFileFindBar(t)))
       .child(
         this.lines.length
-          ? isMd && this.mdPreview && !this.findOpen
+          ? isMd && this.mdPreview && !this.findOpen && !this.diffView
             ? div()
                 .id("files-md-scroll")
                 .flex_1()
                 .min_h(0)
                 .p(16)
                 .overflow_y_scrollbar()
+                .on_mouse_down("left", (e, cx) => {
+                  if (e.click_count >= 2 && !this.fileTruncated) {
+                    cx.stop_propagation();
+                    this.enterEditMode(1, 0, cx);
+                  }
+                })
                 .child(
                   TextView.markdown("files-md-view", this.rawText || "")
                     .selectable(true)
                     .scrollable(false)
                     .w_full(),
                 )
-            : this.rawEditor && this.code && !this.findOpen
-              ? Editor.new(this.code).flex_1().min_h(0)
+            : this.diffView && !this.findOpen
+              ? this.renderInlineDiffView(t)
               : this.renderLinesView(t)
           : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…"),
       );
