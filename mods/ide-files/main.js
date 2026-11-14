@@ -38,6 +38,7 @@ import { searchMethods } from "./search.js";
 import { previewMethods } from "./preview.js";
 
 const STORAGE_KEY = "ide-files.saved";
+const PREFS_KEY = "ide-files.prefs";
 
 export default class IdeFiles extends View {
   init(_props, cx) {
@@ -59,6 +60,48 @@ export default class IdeFiles extends View {
         });
       }
     } catch {}
+    let prefs = {};
+    try {
+      prefs = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") || {};
+    } catch {}
+    this.showLineNumbers = prefs.showLineNumbers !== false;
+    this.wordWrap = Boolean(prefs.wordWrap);
+    this.gitBlame = Boolean(prefs.gitBlame);
+    this.autoSave = Boolean(prefs.autoSave);
+    this.formatOnSave = Boolean(prefs.formatOnSave);
+    this.lspEnabled = prefs.lspEnabled !== false;
+    this.diffView = false;
+    this.moreMenuOpen = false;
+    this.fileDirty = false;
+    this.dirtyFiles = new Map();
+    this.blameByLine = new Map();
+    this.blameLoading = false;
+    this.diffRows = [];
+    this.diffLoading = false;
+    this.editCursorLine = 1;
+    this.editCursorCol = 0;
+    this.editInputFocused = false;
+    this.editLineInput = InputState.new({ placeholder: "" });
+    this.editLineInput.on("change", (_e, cx) => {
+      if (!this.rawEditor || !this.file || this.fileTruncated) return;
+      const val = this.editLineInput.value();
+      const idx = Math.max(0, Math.min(this.lines.length - 1, (this.editCursorLine || 1) - 1));
+      if (this.lines[idx] === val) return;
+      this.lines[idx] = val;
+      this.syncRawTextFromLines(cx);
+    });
+    this.editLineInput.on("submit", (_e, cx) => {
+      if (!this.rawEditor || !this.file || this.fileTruncated) return;
+      this.splitEditLineAtCursor(cx);
+    });
+    this.editLineInput.on("focus", (_e, cx) => {
+      this.editInputFocused = true;
+      cx.notify();
+    });
+    this.editLineInput.on("blur", (_e, cx) => {
+      this.editInputFocused = false;
+      cx.notify();
+    });
     this.baseRoot = null;
     this.hasWorktreeDir = false;
     this.wtDirs = [];
@@ -274,6 +317,8 @@ export default class IdeFiles extends View {
         }
         if (cmd === "focus") {
           this.handle.focus();
+        } else if (cmd === "save") {
+          if (this.file) this.saveCurrentFile(cx);
         } else if (cmd === "find") {
           if (this.file) this.openFileFind(cx);
           else this.quickInput.focus();
@@ -290,6 +335,22 @@ export default class IdeFiles extends View {
 
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
+  }
+
+  persistPrefs() {
+    try {
+      localStorage.setItem(
+        PREFS_KEY,
+        JSON.stringify({
+          showLineNumbers: Boolean(this.showLineNumbers),
+          wordWrap: Boolean(this.wordWrap),
+          gitBlame: Boolean(this.gitBlame),
+          autoSave: Boolean(this.autoSave),
+          formatOnSave: Boolean(this.formatOnSave),
+          lspEnabled: Boolean(this.lspEnabled),
+        }),
+      );
+    } catch {}
   }
 
   persistFolders() {
@@ -805,6 +866,9 @@ export default class IdeFiles extends View {
       const ref = formatRef(path, entry.dir);
       const isDragged = this.drag?.path === path && this.drag?.moved;
       const isActiveFile = !entry.dir && this.file === path;
+      const isDirtyEntry =
+        !entry.dir &&
+        ((this.file === path && this.fileDirty) || this.dirtyFiles?.has(path));
       const fileIcon = !entry.dir ? getFileIcon(entry.name) : null;
 
       const labelColor = fileMark
@@ -908,6 +972,16 @@ export default class IdeFiles extends View {
           )
           .when(!branch, el =>
             el.child(div().flex_1().min_w(0).truncate().text_color(labelColor).child(entry.name)),
+          )
+          .when(Boolean(isDirtyEntry), el =>
+            el.child(
+              div()
+                .flex_none()
+                .ml(5)
+                .size(6)
+                .rounded(3)
+                .bg("#e2b061"),
+            ),
           )
           .when(Boolean(fileMark), el =>
             el.child(
@@ -1426,6 +1500,11 @@ export default class IdeFiles extends View {
       .on_key_down((e, cx) => {
         const k = (e.key || "").toLowerCase();
         const cmdOrCtrl = Boolean(e.modifiers?.platform || e.modifiers?.control);
+        if (cmdOrCtrl && k === "s" && this.file) {
+          cx.stop_propagation();
+          this.saveCurrentFile(cx);
+          return;
+        }
         if (cmdOrCtrl && k === "c" && this.file && !this.rawEditor) {
           const selText = this.getSelectedText?.();
           if (selText) {
@@ -1452,7 +1531,43 @@ export default class IdeFiles extends View {
           }
           return;
         }
+        if (this.rawEditor && this.file && !this.findOpen && !this.moreMenuOpen && !this.contextMenu) {
+          if (k === "escape") {
+            cx.stop_propagation();
+            this.exitEditMode(cx);
+            return;
+          }
+          if (k === "up" || k === "arrowup") {
+            cx.stop_propagation();
+            this.moveEditLine(-1, cx);
+            return;
+          }
+          if (k === "down" || k === "arrowdown") {
+            cx.stop_propagation();
+            this.moveEditLine(1, cx);
+            return;
+          }
+          if (
+            k === "backspace" &&
+            !cmdOrCtrl &&
+            !e.modifiers?.alt &&
+            (this.editCursorLine || 1) > 1 &&
+            (this.editLineInput.value() === "" ||
+              (this.editCursorCol === 0 && !this.editLineTyped))
+          ) {
+            cx.stop_propagation();
+            this.mergeEditLineWithPrev(cx);
+            return;
+          }
+          this.editLineTyped = true;
+        }
         if (k === "escape") {
+          if (this.moreMenuOpen) {
+            cx.stop_propagation();
+            this.moreMenuOpen = false;
+            cx.notify();
+            return;
+          }
           if (this.contextMenu) {
             cx.stop_propagation();
             this.contextMenu = null;
@@ -1462,6 +1577,17 @@ export default class IdeFiles extends View {
           if (this.file && this.findOpen) {
             cx.stop_propagation();
             this.closeFileFind(cx);
+            return;
+          }
+          if (this.file && this.rawEditor) {
+            cx.stop_propagation();
+            this.exitEditMode(cx);
+            return;
+          }
+          if (this.file && this.diffView) {
+            cx.stop_propagation();
+            this.diffView = false;
+            cx.notify();
             return;
           }
           if (!this.file && this.quickFocused) {
@@ -1558,6 +1684,9 @@ export default class IdeFiles extends View {
           .when(!this.rightSidebarCollapsed && this.searchMode, row =>
             row.child(this.renderWorkspaceSearchSidebar(t)),
           ),
+      )
+      .when(Boolean(this.moreMenuOpen && this.file), el =>
+        el.child(this.renderMoreMenuOverlay(t)),
       )
       .when(Boolean(this.contextMenu), el => el.child(this.renderContextMenuOverlay(t)));
   }

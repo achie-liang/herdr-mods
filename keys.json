@@ -73,6 +73,7 @@
     "cmd-backspace": "send:\u0015"
   },
   "mod:ide-files": {
+    "cmd-s": "ide-files.save",
     "cmd-f": "ide-files.find",
     "cmd-shift-f": "ide-files.search_files",
     "cmd-g": "ide-files.find_next",

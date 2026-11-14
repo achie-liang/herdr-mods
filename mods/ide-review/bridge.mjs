@@ -780,20 +780,34 @@ function startServer(appHome) {
           const rawTerms = await queryHcTerminals();
           agents = rawTerms
             .filter(t => t && (t.report?.app || t.state === "running"))
-            .map(t => ({
-              address: t.address || t.id,
-              pane: null,
-              space: "",
-              spaceName: t.labels?.space || "",
-              tabName: t.name || "",
-              status: t.status || "idle",
-              app:
-                t.report?.app ||
-                (Array.isArray(t.argv) ? t.argv[0] : "terminal"),
-              programName: t.report?.app || t.name || t.address,
-              title: t.title || t.name || t.address,
-              focused: false,
-            }));
+            .map(t => {
+              const agentName = t.report?.app || t.name || t.address || "Agent";
+              const spaceName = t.labels?.space || "space";
+              let rawSession = t.labels?.["herdr.session"] || "";
+              if (!rawSession && t.title && String(t.title).startsWith("π - ")) {
+                const parts = String(t.title).slice(4).split(" - ");
+                if (parts.length >= 2) rawSession = parts.slice(0, -1).join(" - ").trim();
+              }
+              if (!rawSession) rawSession = t.name || t.address || "";
+              const shortSession =
+                rawSession.length > 16 ? `${rawSession.slice(0, 16)}...` : rawSession;
+              return {
+                address: t.address || t.id,
+                pane: null,
+                space: "",
+                spaceName,
+                tabName: t.name || "",
+                status: t.status || "idle",
+                app:
+                  t.report?.app ||
+                  (Array.isArray(t.argv) ? t.argv[0] : "terminal"),
+                programName: agentName,
+                title: t.title || t.name || t.address,
+                sessionName: rawSession,
+                displayLabel: `${agentName} · ${spaceName} (${shortSession})`,
+                focused: false,
+              };
+            });
         }
         sendJson(res, 200, {
           ok: true,

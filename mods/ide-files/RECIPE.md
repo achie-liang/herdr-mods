@@ -16,9 +16,15 @@ An IDE-grade file explorer, code viewer, and workspace search & replace panel fo
   - Collapsible Replace input with `AB` (preserve case) toggle and Replace All button, plus `Files to include` and `Files to exclude` glob inputs.
   - Grouped file match list with match count badges, inline diff preview of replacements, and per-file Replace / Dismiss hover buttons.
 - **Unified Top Bar & Code Preview / Editor:**
-  - Top bar (`36px`) with Back/Forward navigation buttons, clickable path breadcrumbs, Markdown `Preview` / `Source` switch, an icon-only **Read-Only / Edit mode toggle** (`codicon-eye.svg` for Read-Only, `codicon-edit.svg` highlighted in accent for Edit mode), Search in Files (`⌘⇧F`), and Right Sidebar toggle.
-  - **Read-Only Mode:** Virtualized line viewer (`20px` row height) with line numbers, **always-on token syntax highlighting**, character-by-character selection (`#3568a899`), scrollbar with amber match ticks, and an optional top Find bar (`34px`, triggered via `⌘F`) with `x of y` match navigation.
-  - **Edit Mode:** Interactive `EditorState` syntax editor with debounced auto-save (`300ms`) back to disk via `writeTextFile`.
+  - Top bar (`36px`) with Back/Forward navigation buttons, clickable path breadcrumbs (with a top-right `*` dirty indicator next to the filename when the file has unsaved edits), Markdown `Preview` / `Source` switch, a **`...` More Actions & Settings menu**, an icon-only **Read-Only / Edit mode toggle** (`codicon-eye.svg` for Read-Only, `codicon-edit.svg` highlighted in accent for Edit mode), Search in Files (`⌘⇧F`), and Right Sidebar toggle.
+  - **Read-Only Mode:** Virtualized line viewer (`20px` row height) with line numbers, **always-on token syntax highlighting**, character-by-character selection (`#3568a899`), scrollbar with amber match ticks, and an optional top Find bar (`34px`, triggered via `⌘F`) with `x of y` match navigation. Double-clicking anywhere in the content view enters **Edit Mode** with the cursor positioned at the clicked line and column.
+  - **Edit Mode:** Inline line editor positioned at the clicked line/column. Pressing `Esc` returns to Read-Only mode; `⌘S` saves the file; `Enter` splits the line; `↑`/`↓` moves between lines.
+  - **`...` More Menu (Cursor-style):**
+    - `Save File (⌘S)` and `Discard Changes`
+    - `Reveal in Finder` and `Copy Relative Path`
+    - `Diff View` toggle (inline Git / unsaved diff view)
+    - `LSP` syntax/token highlighting toggle
+    - `Line Numbers`, `Word Wrap`, `Git Blame` (displayed in a left gutter column before line numbers: aggregates contiguous lines of the same commit into alternating grayscale blocks, shows `author YYYY-MM-DD` on the first line of each block, and opens a multi-line tooltip card with full commit details on hover), `Auto Save`, and `Format on Save` toggles (persisted in `localStorage`).
 
 ## How it behaves
 

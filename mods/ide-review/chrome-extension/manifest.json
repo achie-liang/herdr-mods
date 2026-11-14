@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Herdr UI Review",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq4w3me1MoJcqd0KoBOchgSla6UORnnQYDyGZt8HnNWLfHa+WtE5iQkIcqFvFZoYvIkyrVdDKSNCbRd+WtXAUn+3i5t+gR5MmyiIs36mnUxU8V7ED/cwOZr2yYxhkIjAjBbhy7hvC/ni15hltY8XtUWMFDWRs4ABj+3EwYQ9DvdGNWd2mfkt6OTqzVZuoAvsGGRqdLeWz2V6pB94+C99tE6vwLxZcmHBT6V7pRTgqpu+G7Mb694nURHmmvBXkInIxOzKFBUXMI1CrKRJoRyTS/VjqOE+7iQnBqZwSbQT8jTVVSt5S/iPD4gURBEslbFPXANRn5PqnnsIJaMuW2ODtGQIDAQAB",
   "description": "Batch-review UI elements & regions with React/Vue source locations and send them directly to Herdr coding agents.",
   "permissions": [

@@ -253,6 +253,9 @@ export default class Agents extends View {
           const parsed = JSON.parse(r.stdout.trim());
           const prev = JSON.stringify(this.sessions);
           this.sessions = { ...this.sessions, ...parsed };
+          try {
+            setShared("ide.agent_sessions", this.sessions);
+          } catch {}
           if (JSON.stringify(this.sessions) !== prev) cx.notify();
         }
       } catch {}

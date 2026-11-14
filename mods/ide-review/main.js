@@ -610,7 +610,7 @@ export default class IdeReview extends View {
               )
               .child(
                 div()
-                  .max_w(150)
+                  .max_w(220)
                   .truncate()
                   .text_size(11.5)
                   .text_color(t.foreground)
@@ -704,6 +704,9 @@ export default class IdeReview extends View {
               ctx.agents.map(a => {
                 const chosen = currentAgentAddr === a.address;
                 const count = this.countItemsForAgent(a.address);
+                const label =
+                  a.displayLabel ||
+                  `${a.programName} · ${a.spaceName} (${a.sessionName || a.address})`;
                 return div()
                   .id(`agent-opt-${a.address}`)
                   .px(8)
@@ -720,11 +723,7 @@ export default class IdeReview extends View {
                     this.syncActiveBatchForAgent();
                     cx.notify();
                   })
-                  .child(
-                    `${a.programName} · ${a.spaceName} (${a.address})${
-                      count > 0 ? ` [${count}]` : ""
-                    }`,
-                  );
+                  .child(`${label}${count > 0 ? ` [${count}]` : ""}`);
               }),
             ),
         ),

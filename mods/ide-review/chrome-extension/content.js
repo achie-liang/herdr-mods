@@ -1,5 +1,5 @@
 (function () {
-  const SCRIPT_VERSION = "1.4.1";
+  const SCRIPT_VERSION = "1.4.2";
   if (window.__herdrAnnotatorVersion === SCRIPT_VERSION) return;
   if (typeof window.__herdrAnnotatorCleanup === "function") {
     try {
@@ -1180,7 +1180,17 @@
     for (const a of state.bridge.agents) {
       const opt = document.createElement("option");
       opt.value = a.address;
-      opt.textContent = `To: ${a.programName} · ${a.spaceName || "space"} (${a.address})`;
+      const agentName = a.programName || "Agent";
+      const spaceName = a.spaceName || "space";
+      const rawSession = String(a.sessionName || a.tabName || a.address || "").trim();
+      const shortSession =
+        rawSession.length > 16 ? `${rawSession.slice(0, 16)}...` : rawSession;
+      const label =
+        a.displayLabel ||
+        (shortSession
+          ? `${agentName} · ${spaceName} (${shortSession})`
+          : `${agentName} · ${spaceName}`);
+      opt.textContent = `To: ${label}`;
       els.agentSelect.appendChild(opt);
     }
     els.agentSelect.value = currentTarget;
