@@ -23,6 +23,7 @@ import {
   STATUS_PRIORITY,
   location,
   locationKey,
+  matchAgentWorktreeFeature,
   formatRef,
   pasteIntoTerminal,
 } from "./utils.js";
@@ -51,11 +52,12 @@ export default class IdeFiles extends View {
           "{}",
       );
       for (const [k, v] of Object.entries(raw)) {
+        const userSpecified = Boolean(v.userSpecified);
         this.saved.set(k, {
           folders: new Set(v.folders || []),
           recents: Array.isArray(v.recents) ? v.recents : [],
-          selectedFeature: v.selectedFeature || null,
-          userPinnedRoot: Boolean(v.userPinnedRoot),
+          selectedFeature: userSpecified ? v.selectedFeature || null : null,
+          userSpecified,
           file: null,
         });
       }
@@ -108,7 +110,7 @@ export default class IdeFiles extends View {
     this.wtFeatures = [];
     this.wtLoaded = false;
     this.selectedFeature = null;
-    this.userPinnedRoot = false;
+    this.userSpecified = false;
     this.wtDropdownOpen = false;
     const initReq = shared("ide.open_file_request");
     this.lastOpenReqId =
@@ -359,7 +361,7 @@ export default class IdeFiles extends View {
       folders: new Set(this.folders),
       recents: [...(this.recents || [])],
       selectedFeature: this.selectedFeature || null,
-      userPinnedRoot: Boolean(this.userPinnedRoot),
+      userSpecified: Boolean(this.userSpecified),
       file: this.file,
       history: [...(this.history || [null])],
       historyIdx: this.historyIdx || 0,
@@ -371,24 +373,28 @@ export default class IdeFiles extends View {
           folders: [...(v.folders || [])],
           recents: [...(v.recents || [])],
           selectedFeature: v.selectedFeature || null,
-          userPinnedRoot: Boolean(v.userPinnedRoot),
+          userSpecified: Boolean(v.userSpecified),
         };
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
     } catch {}
-    writeSharedWtState(this.context.key, this.selectedFeature, this.userPinnedRoot);
+    writeSharedWtState(this.context.key, this.selectedFeature, this.userSpecified);
   }
 
   selectFeature(relPath, cx, opts = null) {
     const nextFeature = relPath || null;
-    const nextPinned = !nextFeature;
+    const nextUserSpecified =
+      opts && typeof opts.userSpecified === "boolean" ? opts.userSpecified : true;
     this.wtDropdownOpen = false;
-    if (this.selectedFeature === nextFeature && this.userPinnedRoot === nextPinned) {
+    if (
+      this.selectedFeature === nextFeature &&
+      Boolean(this.userSpecified) === nextUserSpecified
+    ) {
       cx.notify();
       return;
     }
     this.selectedFeature = nextFeature;
-    this.userPinnedRoot = nextPinned;
+    this.userSpecified = nextUserSpecified;
     this.root =
       this.selectedFeature && this.baseRoot
         ? `${this.baseRoot}/${this.selectedFeature}`
@@ -424,23 +430,32 @@ export default class IdeFiles extends View {
   syncSharedWorktree(cx) {
     if (!this.context?.key) return;
     const sharedState = readSharedWtState(this.context.key);
-    if (!sharedState) return;
-    let wantFeature = sharedState.selectedFeature || null;
-    let wantPinned = Boolean(sharedState.userPinnedRoot);
-    if (
-      wantFeature &&
-      this.wtLoaded &&
-      !this.wtFeatures.some(f => f.relPath === wantFeature)
-    ) {
-      wantFeature = null;
-      wantPinned = this.wtFeatures.length > 0;
-      writeSharedWtState(this.context.key, null, wantPinned);
+    if (sharedState) {
+      let wantFeature = sharedState.selectedFeature || null;
+      let wantUserSpecified = Boolean(sharedState.userSpecified);
+      if (
+        wantFeature &&
+        this.wtLoaded &&
+        !this.wtFeatures.some(f => f.relPath === wantFeature)
+      ) {
+        wantFeature = null;
+        wantUserSpecified = false;
+        writeSharedWtState(this.context.key, null, false);
+      }
+      if (wantFeature !== (this.selectedFeature || null)) {
+        this.selectFeature(wantFeature, cx, { userSpecified: wantUserSpecified });
+        return;
+      }
+      if (wantUserSpecified !== Boolean(this.userSpecified)) {
+        this.userSpecified = wantUserSpecified;
+      }
     }
-    if (wantFeature !== (this.selectedFeature || null)) {
-      this.userPinnedRoot = wantPinned;
-      this.selectFeature(wantFeature, cx);
-    } else if (wantPinned !== Boolean(this.userPinnedRoot)) {
-      this.userPinnedRoot = wantPinned;
+    if (!this.userSpecified && this.wtLoaded) {
+      const { agentCandidates } = location();
+      const autoFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      if (autoFeature !== (this.selectedFeature || null)) {
+        this.selectFeature(autoFeature, cx, { userSpecified: false });
+      }
     }
   }
 
@@ -463,7 +478,13 @@ export default class IdeFiles extends View {
       }
       const wantFeature = req.selectedFeature || null;
       if (wantFeature !== (this.selectedFeature || null)) {
-        this.selectFeature(wantFeature, cx, { keepOpenFile: true });
+        this.selectFeature(wantFeature, cx, {
+          keepOpenFile: true,
+          userSpecified:
+            typeof req.userSpecified === "boolean"
+              ? req.userSpecified
+              : Boolean(this.userSpecified),
+        });
       } else if (this.baseRoot) {
         this.root = this.selectedFeature
           ? `${this.baseRoot}/${this.selectedFeature}`
@@ -527,13 +548,14 @@ export default class IdeFiles extends View {
   }
 
   current(context) {
-    const { cwd: rawCwd, on } = location();
+    if (!context) return false;
+    const { cwd: rawCwd, on, agentKey } = location();
     let baseRoot = rawCwd;
     if (rawCwd) {
       const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
       if (wtMatch && wtMatch[1]) baseRoot = wtMatch[1];
     }
-    return this.context === context && JSON.stringify({ baseRoot, on }) === context.key;
+    return this.context === context && JSON.stringify({ baseRoot, on, agentKey }) === context.key;
   }
 
   async loadFolder(path, context) {
@@ -631,7 +653,7 @@ export default class IdeFiles extends View {
 
   refresh(cx) {
     this.rememberTarget();
-    const { cwd: rawCwd, on } = location();
+    const { cwd: rawCwd, on, agentKey, agentCandidates } = location();
     let baseRoot = rawCwd;
     let detectedFeature = null;
     if (rawCwd) {
@@ -641,14 +663,16 @@ export default class IdeFiles extends View {
         detectedFeature = `${wtMatch[2]}/${wtMatch[3]}`;
       }
     }
-    const next = JSON.stringify({ baseRoot, on });
+    const next = JSON.stringify({ baseRoot, on, agentKey });
     if (next !== this.context?.key) {
+      const sameWorkspace =
+        this.context && this.context.baseRoot === baseRoot && this.context.on === on;
       if (this.context) {
         this.saved.set(this.context.key, {
           folders: this.folders,
           recents: this.recents || [],
           selectedFeature: this.selectedFeature || null,
-          userPinnedRoot: Boolean(this.userPinnedRoot),
+          userSpecified: Boolean(this.userSpecified),
           file: this.file,
           history: this.history || [null],
           historyIdx: this.historyIdx || 0,
@@ -656,21 +680,43 @@ export default class IdeFiles extends View {
       }
       const saved = this.saved.get(next);
       const sharedState = readSharedWtState(next);
-      this.baseRoot = baseRoot;
-      this.selectedFeature =
-        sharedState?.selectedFeature ??
-        saved?.selectedFeature ??
-        detectedFeature ??
-        null;
-      this.userPinnedRoot =
+      const hasManual =
         sharedState !== null
-          ? Boolean(sharedState.userPinnedRoot)
-          : Boolean(saved?.userPinnedRoot);
+          ? Boolean(sharedState.userSpecified)
+          : Boolean(saved?.userSpecified);
+      this.baseRoot = baseRoot;
+      this.userSpecified = hasManual;
+      if (!sameWorkspace) {
+        this.hasWorktreeDir = false;
+        this.wtDirs = [];
+        this.wtFeatures = [];
+        this.wtLoaded = false;
+      }
+      if (hasManual) {
+        this.selectedFeature =
+          sharedState !== null
+            ? sharedState.selectedFeature || null
+            : saved?.selectedFeature || null;
+      } else if (sameWorkspace && this.wtLoaded) {
+        this.selectedFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      } else {
+        this.selectedFeature =
+          sharedState?.selectedFeature ??
+          saved?.selectedFeature ??
+          detectedFeature ??
+          null;
+      }
       this.wtDropdownOpen = false;
-      this.wtLoaded = false;
       const activeRoot =
         this.selectedFeature && baseRoot ? `${baseRoot}/${this.selectedFeature}` : baseRoot;
-      this.context = { key: next, cwd: activeRoot, baseRoot, on };
+      this.context = {
+        key: next,
+        cwd: activeRoot,
+        baseRoot,
+        on,
+        agentKey,
+        agentCandidates,
+      };
       this.root = activeRoot;
       this.on = on;
       this.entries = new Map();
@@ -718,13 +764,29 @@ export default class IdeFiles extends View {
         this.wtDirs = wtInfo.wtDirs;
         this.wtFeatures = wtInfo.features;
         this.wtLoaded = true;
-        let wtChanged = false;
+
+        let nextFeature = this.selectedFeature;
+        let nextUserSpecified = Boolean(this.userSpecified);
         if (
-          this.selectedFeature &&
-          !this.wtFeatures.some(f => f.relPath === this.selectedFeature)
+          nextFeature &&
+          !this.wtFeatures.some(f => f.relPath === nextFeature)
         ) {
-          this.selectedFeature = null;
-          this.userPinnedRoot = this.wtFeatures.length > 0;
+          nextFeature = null;
+          nextUserSpecified = false;
+        }
+        if (!nextUserSpecified) {
+          const { agentCandidates: liveCandidates } = location();
+          const candidates = liveCandidates?.length
+            ? liveCandidates
+            : context.agentCandidates || [];
+          nextFeature = matchAgentWorktreeFeature(this.wtFeatures, candidates);
+        }
+
+        const featureChanged = nextFeature !== this.selectedFeature;
+        const specChanged = nextUserSpecified !== Boolean(this.userSpecified);
+        this.selectedFeature = nextFeature;
+        this.userSpecified = nextUserSpecified;
+        if (featureChanged) {
           this.entries = new Map();
           this.folders = new Set();
           this.pending = new Set();
@@ -733,17 +795,8 @@ export default class IdeFiles extends View {
           this.history = [null];
           this.historyIdx = 0;
           this.show(null, null, { fromHistory: true });
-          wtChanged = true;
         }
-        if (this.wtFeatures.length === 0 && this.userPinnedRoot) {
-          this.userPinnedRoot = false;
-          wtChanged = true;
-        }
-        if (!this.selectedFeature && !this.userPinnedRoot && this.wtFeatures.length > 0) {
-          this.selectedFeature = this.wtFeatures[0].relPath;
-          wtChanged = true;
-        }
-        if (wtChanged) {
+        if (featureChanged || specChanged) {
           this.persistFolders();
         }
         const effectiveRoot =
@@ -1451,13 +1504,22 @@ export default class IdeFiles extends View {
       rawWantFeature && this.wtLoaded && !this.wtFeatures.some(f => f.relPath === rawWantFeature)
         ? null
         : rawWantFeature;
-    const hasWtChange =
+    const hasSharedWtChange =
       sharedState &&
       (validWantFeature !== (this.selectedFeature || null) ||
         rawWantFeature !== validWantFeature ||
-        Boolean(sharedState.userPinnedRoot) !== Boolean(this.userPinnedRoot));
+        Boolean(sharedState.userSpecified) !== Boolean(this.userSpecified));
 
-    if (!hasOpenReq && !hasWtChange) return;
+    let hasAutoWtChange = false;
+    if (!this.userSpecified && !sharedState?.userSpecified && this.wtLoaded) {
+      const { agentCandidates } = location();
+      const autoFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      if (autoFeature !== (this.selectedFeature || null)) {
+        hasAutoWtChange = true;
+      }
+    }
+
+    if (!hasOpenReq && !hasSharedWtChange && !hasAutoWtChange) return;
     this.syncTaskScheduled = true;
     cx.spawn(async cx => {
       try {
