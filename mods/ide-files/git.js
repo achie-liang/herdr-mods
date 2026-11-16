@@ -229,7 +229,7 @@ export function readSharedWtState(contextKey) {
   return null;
 }
 
-export function writeSharedWtState(contextKey, selectedFeature, userPinnedRoot) {
+export function writeSharedWtState(contextKey, selectedFeature, userSpecified) {
   if (!contextKey) return;
   try {
     const prev = shared(SHARED_WT_KEY);
@@ -238,13 +238,13 @@ export function writeSharedWtState(contextKey, selectedFeature, userPinnedRoot) 
     if (
       cur &&
       (cur.selectedFeature || null) === (selectedFeature || null) &&
-      Boolean(cur.userPinnedRoot) === Boolean(userPinnedRoot)
+      Boolean(cur.userSpecified) === Boolean(userSpecified)
     ) {
       return;
     }
     all[contextKey] = {
       selectedFeature: selectedFeature || null,
-      userPinnedRoot: Boolean(userPinnedRoot),
+      userSpecified: Boolean(userSpecified),
       updatedAt: Date.now(),
     };
     setShared(SHARED_WT_KEY, all);

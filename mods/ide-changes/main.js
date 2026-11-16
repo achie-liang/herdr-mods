@@ -16,6 +16,7 @@ import {
 import { getFileIcon, ICON_PREFIX } from "./icons.js";
 import {
   location,
+  matchAgentWorktreeFeature,
   formatRef,
   pasteIntoTerminal,
   READ,
@@ -106,9 +107,10 @@ export default class IdeChanges extends View {
     try {
       const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       for (const [k, v] of Object.entries(raw)) {
+        const userSpecified = Boolean(v.userSpecified);
         this.saved.set(k, {
-          selectedFeature: v.selectedFeature || null,
-          userPinnedRoot: Boolean(v.userPinnedRoot),
+          selectedFeature: userSpecified ? v.selectedFeature || null : null,
+          userSpecified,
           foldedGroups: new Set(v.foldedGroups || []),
           collapsedFolders: new Set(v.collapsedFolders || []),
         });
@@ -121,7 +123,7 @@ export default class IdeChanges extends View {
     this.wtFeatures = [];
     this.wtLoaded = false;
     this.selectedFeature = null;
-    this.userPinnedRoot = false;
+    this.userSpecified = false;
     this.wtDropdownOpen = false;
     this.rightSidebarCollapsed = false;
     this.refreshSeq = 0;
@@ -250,20 +252,20 @@ export default class IdeChanges extends View {
 
   current(context) {
     if (!context) return false;
-    const { cwd: rawCwd, on } = location();
+    const { cwd: rawCwd, on, agentKey } = location();
     let baseRoot = rawCwd;
     if (rawCwd) {
       const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
       if (wtMatch && wtMatch[1]) baseRoot = wtMatch[1];
     }
-    return this.context === context && JSON.stringify({ baseRoot, on }) === context.key;
+    return this.context === context && JSON.stringify({ baseRoot, on, agentKey }) === context.key;
   }
 
   persistState() {
     if (!this.context?.key) return;
     this.saved.set(this.context.key, {
       selectedFeature: this.selectedFeature || null,
-      userPinnedRoot: Boolean(this.userPinnedRoot),
+      userSpecified: Boolean(this.userSpecified),
       foldedGroups: new Set(this.foldedGroups),
       collapsedFolders: new Set(this.collapsedFolders),
     });
@@ -272,26 +274,30 @@ export default class IdeChanges extends View {
       for (const [k, v] of this.saved.entries()) {
         obj[k] = {
           selectedFeature: v.selectedFeature || null,
-          userPinnedRoot: Boolean(v.userPinnedRoot),
+          userSpecified: Boolean(v.userSpecified),
           foldedGroups: [...(v.foldedGroups || [])],
           collapsedFolders: [...(v.collapsedFolders || [])],
         };
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
     } catch {}
-    writeSharedWtState(this.context.key, this.selectedFeature, this.userPinnedRoot);
+    writeSharedWtState(this.context.key, this.selectedFeature, this.userSpecified);
   }
 
-  selectFeature(relPath, cx) {
+  selectFeature(relPath, cx, opts = null) {
     const nextFeature = relPath || null;
-    const nextPinned = !nextFeature;
+    const nextUserSpecified =
+      opts && typeof opts.userSpecified === "boolean" ? opts.userSpecified : true;
     this.wtDropdownOpen = false;
-    if (this.selectedFeature === nextFeature && this.userPinnedRoot === nextPinned) {
+    if (
+      this.selectedFeature === nextFeature &&
+      Boolean(this.userSpecified) === nextUserSpecified
+    ) {
       cx.notify();
       return;
     }
     this.selectedFeature = nextFeature;
-    this.userPinnedRoot = nextPinned;
+    this.userSpecified = nextUserSpecified;
     this.root =
       this.selectedFeature && this.baseRoot
         ? `${this.baseRoot}/${this.selectedFeature}`
@@ -322,23 +328,32 @@ export default class IdeChanges extends View {
   syncSharedWorktree(cx) {
     if (!this.context?.key) return;
     const sharedState = readSharedWtState(this.context.key);
-    if (!sharedState) return;
-    let wantFeature = sharedState.selectedFeature || null;
-    let wantPinned = Boolean(sharedState.userPinnedRoot);
-    if (
-      wantFeature &&
-      this.wtLoaded &&
-      !this.wtFeatures.some(f => f.relPath === wantFeature)
-    ) {
-      wantFeature = null;
-      wantPinned = this.wtFeatures.length > 0;
-      writeSharedWtState(this.context.key, null, wantPinned);
+    if (sharedState) {
+      let wantFeature = sharedState.selectedFeature || null;
+      let wantUserSpecified = Boolean(sharedState.userSpecified);
+      if (
+        wantFeature &&
+        this.wtLoaded &&
+        !this.wtFeatures.some(f => f.relPath === wantFeature)
+      ) {
+        wantFeature = null;
+        wantUserSpecified = false;
+        writeSharedWtState(this.context.key, null, false);
+      }
+      if (wantFeature !== (this.selectedFeature || null)) {
+        this.selectFeature(wantFeature, cx, { userSpecified: wantUserSpecified });
+        return;
+      }
+      if (wantUserSpecified !== Boolean(this.userSpecified)) {
+        this.userSpecified = wantUserSpecified;
+      }
     }
-    if (wantFeature !== (this.selectedFeature || null)) {
-      this.userPinnedRoot = wantPinned;
-      this.selectFeature(wantFeature, cx);
-    } else if (wantPinned !== Boolean(this.userPinnedRoot)) {
-      this.userPinnedRoot = wantPinned;
+    if (!this.userSpecified && this.wtLoaded) {
+      const { agentCandidates } = location();
+      const autoFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      if (autoFeature !== (this.selectedFeature || null)) {
+        this.selectFeature(autoFeature, cx, { userSpecified: false });
+      }
     }
   }
 
@@ -359,6 +374,7 @@ export default class IdeChanges extends View {
         contextKey: this.context?.key || null,
         baseRoot: this.baseRoot || this.root || null,
         selectedFeature: this.selectedFeature || null,
+        userSpecified: Boolean(this.userSpecified),
         path: relPath,
         lineNo: typeof lineNo === "number" && lineNo > 0 ? lineNo : null,
         ts: Date.now(),
@@ -499,7 +515,7 @@ export default class IdeChanges extends View {
 
   refresh(cx, force = false) {
     if (this.busy) return;
-    const { cwd: rawCwd, on } = location();
+    const { cwd: rawCwd, on, agentKey, agentCandidates } = location();
     let baseRoot = rawCwd;
     let detectedFeature = null;
     if (rawCwd) {
@@ -509,33 +525,57 @@ export default class IdeChanges extends View {
         detectedFeature = `${wtMatch[2]}/${wtMatch[3]}`;
       }
     }
-    const next = JSON.stringify({ baseRoot, on });
+    const next = JSON.stringify({ baseRoot, on, agentKey });
     if (next !== this.context?.key) {
+      const sameWorkspace =
+        this.context && this.context.baseRoot === baseRoot && this.context.on === on;
       if (this.context) {
         this.saved.set(this.context.key, {
           selectedFeature: this.selectedFeature || null,
-          userPinnedRoot: Boolean(this.userPinnedRoot),
+          userSpecified: Boolean(this.userSpecified),
           foldedGroups: new Set(this.foldedGroups),
           collapsedFolders: new Set(this.collapsedFolders),
         });
       }
       const saved = this.saved.get(next);
       const sharedState = readSharedWtState(next);
-      this.baseRoot = baseRoot;
-      this.selectedFeature =
-        sharedState?.selectedFeature ??
-        saved?.selectedFeature ??
-        detectedFeature ??
-        null;
-      this.userPinnedRoot =
+      const hasManual =
         sharedState !== null
-          ? Boolean(sharedState.userPinnedRoot)
-          : Boolean(saved?.userPinnedRoot);
+          ? Boolean(sharedState.userSpecified)
+          : Boolean(saved?.userSpecified);
+      this.baseRoot = baseRoot;
+      this.userSpecified = hasManual;
+      if (!sameWorkspace) {
+        this.hasWorktreeDir = false;
+        this.wtDirs = [];
+        this.wtFeatures = [];
+        this.wtLoaded = false;
+      }
+      if (hasManual) {
+        this.selectedFeature =
+          sharedState !== null
+            ? sharedState.selectedFeature || null
+            : saved?.selectedFeature || null;
+      } else if (sameWorkspace && this.wtLoaded) {
+        this.selectedFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      } else {
+        this.selectedFeature =
+          sharedState?.selectedFeature ??
+          saved?.selectedFeature ??
+          detectedFeature ??
+          null;
+      }
       this.wtDropdownOpen = false;
-      this.wtLoaded = false;
       const activeRoot =
         this.selectedFeature && baseRoot ? `${baseRoot}/${this.selectedFeature}` : baseRoot;
-      this.context = { key: next, cwd: activeRoot, baseRoot, on };
+      this.context = {
+        key: next,
+        cwd: activeRoot,
+        baseRoot,
+        on,
+        agentKey,
+        agentCandidates,
+      };
       this.root = activeRoot;
       this.on = on;
       this.foldedGroups = new Set(saved?.foldedGroups);
@@ -587,27 +627,34 @@ export default class IdeChanges extends View {
         this.wtDirs = wtInfo.wtDirs;
         this.wtFeatures = wtInfo.features;
         this.wtLoaded = true;
-        let wtChanged = false;
+
+        let nextFeature = this.selectedFeature;
+        let nextUserSpecified = Boolean(this.userSpecified);
         if (
-          this.selectedFeature &&
-          !this.wtFeatures.some(f => f.relPath === this.selectedFeature)
+          nextFeature &&
+          !this.wtFeatures.some(f => f.relPath === nextFeature)
         ) {
-          this.selectedFeature = null;
-          this.userPinnedRoot = this.wtFeatures.length > 0;
+          nextFeature = null;
+          nextUserSpecified = false;
+        }
+        if (!nextUserSpecified) {
+          const { agentCandidates: liveCandidates } = location();
+          const candidates = liveCandidates?.length
+            ? liveCandidates
+            : context.agentCandidates || [];
+          nextFeature = matchAgentWorktreeFeature(this.wtFeatures, candidates);
+        }
+
+        const featureChanged = nextFeature !== this.selectedFeature;
+        const specChanged = nextUserSpecified !== Boolean(this.userSpecified);
+        this.selectedFeature = nextFeature;
+        this.userSpecified = nextUserSpecified;
+        if (featureChanged) {
           this.open = null;
           this.diffScroll = 0;
           this.setLines([]);
-          wtChanged = true;
         }
-        if (this.wtFeatures.length === 0 && this.userPinnedRoot) {
-          this.userPinnedRoot = false;
-          wtChanged = true;
-        }
-        if (!this.selectedFeature && !this.userPinnedRoot && this.wtFeatures.length > 0) {
-          this.selectedFeature = this.wtFeatures[0].relPath;
-          wtChanged = true;
-        }
-        if (wtChanged) {
+        if (featureChanged || specChanged) {
           this.persistState();
         }
         const effectiveRoot =
@@ -2090,12 +2137,22 @@ export default class IdeChanges extends View {
       rawWantFeature && this.wtLoaded && !this.wtFeatures.some(f => f.relPath === rawWantFeature)
         ? null
         : rawWantFeature;
-    const hasWtChange =
+    const hasSharedWtChange =
       sharedState &&
       (validWantFeature !== (this.selectedFeature || null) ||
         rawWantFeature !== validWantFeature ||
-        Boolean(sharedState.userPinnedRoot) !== Boolean(this.userPinnedRoot));
-    if (!hasWtChange) return;
+        Boolean(sharedState.userSpecified) !== Boolean(this.userSpecified));
+
+    let hasAutoWtChange = false;
+    if (!this.userSpecified && !sharedState?.userSpecified && this.wtLoaded) {
+      const { agentCandidates } = location();
+      const autoFeature = matchAgentWorktreeFeature(this.wtFeatures, agentCandidates);
+      if (autoFeature !== (this.selectedFeature || null)) {
+        hasAutoWtChange = true;
+      }
+    }
+
+    if (!hasSharedWtChange && !hasAutoWtChange) return;
     this.syncTaskScheduled = true;
     cx.spawn(async cx => {
       try {
