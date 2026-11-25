@@ -12,21 +12,15 @@ import {
   settings,
   exec,
   readTextFile,
-  writeTextFile,
   watchFolder,
   notify,
   appHome,
   nextCommand,
+  checking,
 } from "herdr";
 import {
   annotationsDir,
-  queueFilePath,
-  commandFilePath,
-  contextFilePath,
   currentWorkspaceContext,
-  formatMultiBatchPrompt,
-  pastePromptIntoAgent,
-  sendPromptToAgent,
 } from "./format.js";
 
 function find(node, id) {
@@ -44,7 +38,7 @@ export default class IdeTabs extends View {
     this.scroll = ScrollHandle.new();
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
     this.annotationCount = 0;
-    this.lastCommandId = localStorage.getItem("ide-annotate.lastCmdId") || null;
+    this.bridgeError = null;
     this.lastContextKey = "";
     this.watchingAnnotations = false;
 
@@ -59,6 +53,7 @@ export default class IdeTabs extends View {
       }
     });
 
+    if (checking()) return;
     this.bootstrapAnnotationBridge(cx);
     cx.timer.every(6000, cx => {
       this.syncAnnotationContext();
@@ -73,8 +68,11 @@ export default class IdeTabs extends View {
       await exec("node", [script, "--daemon", "--app-home", base]);
       await this.syncAnnotationContext();
       await this.checkAnnotationQueue(cx);
-      this.startAnnotationWatch(cx);
-    } catch {}
+      // Poll only: watching files that our CLI updates can create a feedback loop.
+    } catch (e) {
+      this.bridgeError = String(e?.message || e);
+      notify({ title: 'Review bridge unavailable', body: this.bridgeError, level: 'error' });
+    }
   }
 
   startAnnotationWatch(cx) {
@@ -106,15 +104,20 @@ export default class IdeTabs extends View {
       });
       if (key === this.lastContextKey) return;
       this.lastContextKey = key;
-      const path = contextFilePath();
-      const prev = await readTextFile(path);
-      await writeTextFile(path, JSON.stringify(ctx, null, 2), prev);
+      if (checking()) return;
+      const base = appHome();
+      const result = await exec('node', [`${base}/mods/ide-review/bridge.mjs`, '--context', '--app-home', base, '--json', JSON.stringify(ctx)]);
+      if (result.code !== 0) this.lastContextKey = '';
     } catch {}
   }
 
   async checkAnnotationQueue(cx) {
     try {
-      const qRaw = await readTextFile(queueFilePath());
+      if (checking()) return;
+      const base = appHome();
+      const result = await exec('node', [`${base}/mods/ide-review/bridge.mjs`, '--queue', '--app-home', base]);
+      if (result.code !== 0) throw new Error('Secure bridge queue unavailable');
+      const qRaw = result.stdout;
       let batches = [];
       if (qRaw) {
         const parsed = JSON.parse(qRaw);
@@ -129,83 +132,7 @@ export default class IdeTabs extends View {
         cx.notify();
       }
 
-      const cmdRaw = await readTextFile(commandFilePath());
-      if (!cmdRaw) return;
-      const cmd = JSON.parse(cmdRaw);
-      if (!cmd?.id || cmd.id === this.lastCommandId) return;
-      // Ignore stale commands older than 30s on cold restart
-      if (cmd.createdAt && Date.now() - cmd.createdAt > 30000) {
-        this.lastCommandId = cmd.id;
-        localStorage.setItem("ide-annotate.lastCmdId", cmd.id);
-        return;
-      }
-
-      this.lastCommandId = cmd.id;
-      localStorage.setItem("ide-annotate.lastCmdId", cmd.id);
-
-      const batch = batches.find(b => b.id === cmd.batchId) || batches[0];
-      if (!batch) return;
-
-      const targetAddr = cmd.targetTerminal || batch.targetTerminal || null;
-      const agentBatches = targetAddr
-        ? batches.filter(
-            b => !b.targetTerminal || b.targetTerminal === targetAddr,
-          )
-        : [batch];
-
-      const target = {
-        terminal: targetAddr,
-        pane: cmd.targetPane || batch.targetPane || null,
-      };
-
-      if (cmd.action === "stage") {
-        run("layout.select", { stack: "panel-body", child: "review" });
-        run("layout.show", { id: "panel" });
-        notify({
-          title: "UI Review Staged",
-          body: `${(batch.items || []).length} items ready in Review panel`,
-          level: "info",
-          timeout: 3000,
-        });
-      } else if (cmd.action === "send") {
-        const text = formatMultiBatchPrompt(agentBatches, {
-          includeScreenshot: true,
-        });
-        if (text) {
-          await sendPromptToAgent(text, cx, target);
-          const sentIds = new Set(agentBatches.map(b => b.id));
-          const remaining = batches.filter(b => !sentIds.has(b.id));
-          await writeTextFile(
-            queueFilePath(),
-            JSON.stringify({ batches: remaining }, null, 2),
-            qRaw,
-          );
-          this.annotationCount = remaining.reduce(
-            (acc, b) => acc + (Array.isArray(b.items) ? b.items.length : 0),
-            0,
-          );
-        }
-      } else {
-        // Default: "paste"
-        const text = formatMultiBatchPrompt(agentBatches, {
-          includeScreenshot: true,
-        });
-        if (text) {
-          pastePromptIntoAgent(text, cx, target);
-          const sentIds = new Set(agentBatches.map(b => b.id));
-          const remaining = batches.filter(b => !sentIds.has(b.id));
-          await writeTextFile(
-            queueFilePath(),
-            JSON.stringify({ batches: remaining }, null, 2),
-            qRaw,
-          );
-          this.annotationCount = remaining.reduce(
-            (acc, b) => acc + (Array.isArray(b.items) ? b.items.length : 0),
-            0,
-          );
-        }
-      }
-      cx.notify();
+      // Legacy command.json is deliberately ignored: browser data cannot drive terminals.
     } catch {}
   }
 
@@ -264,7 +191,7 @@ export default class IdeTabs extends View {
       this.selectedIndex = active;
       if (active >= 0) this.scroll.scroll_to_item(active);
     }
-    this.syncAnnotationContext();
+    if (!checking()) this.syncAnnotationContext();
 
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) =>
@@ -390,14 +317,9 @@ export default class IdeTabs extends View {
 
     const panel = find(root, "panel");
     const body = find(root, "panel-body");
-    const rawEnabled = shared("workspace.panels") ?? [
-      "files",
-      "changes",
-      "review",
-    ];
-    const enabled = rawEnabled.includes("review")
-      ? rawEnabled
-      : [...rawEnabled, "review"];
+    // This personal layout bundles all three panels. The shipped welcome
+    // screen's workspace.panels preference must not hide their entry points.
+    const enabled = ["files", "changes", "review"];
     this.syncPanel(space, panel, body, enabled);
 
     const panelButton = (id, label, icon, badgeCount = 0) => {
