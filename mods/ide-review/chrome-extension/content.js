@@ -1,5 +1,5 @@
 (function () {
-  const SCRIPT_VERSION = "1.4.2";
+  const SCRIPT_VERSION = "2.0.3";
   if (window.__herdrAnnotatorVersion === SCRIPT_VERSION) return;
   if (typeof window.__herdrAnnotatorCleanup === "function") {
     try {
@@ -8,6 +8,16 @@
   }
   window.__herdrAnnotatorVersion = SCRIPT_VERSION;
   window.__herdrAnnotatorLoaded = true;
+
+  // A page outlives the extension that injected it. Sends go through the guarded
+  // transport so a reload or update of Herdr UI Review disposes this stale copy
+  // instead of throwing "Extension context invalidated" from timers and handlers.
+  // The worker injects runtime-connection.js first; without it nothing may send.
+  if (!window.__herdrRuntimeConnection) return;
+  const transport = window.__herdrRuntimeConnection.create(
+    () => chrome.runtime,
+    () => disposeAnnotator(),
+  );
 
   const MAX_CUSTOM_TAGS = 6;
   const CUSTOM_TAGS_STORAGE_KEY = "__herdr_ui_review_custom_tags__";
@@ -32,7 +42,9 @@
   ];
 
   const state = {
+    disposed: false,
     active: false,
+    activationNonce: null,
     currentUrl: location.href,
     items: [], // { id, kind, element, rect, pageRect, note, tagName, selector, text, selectedText, htmlSnippet, styles, source, groupedElements }
     hoveredEl: null,
@@ -49,6 +61,7 @@
     silentStageTimer: null,
     toast: null,
     toastTimer: null,
+    heartbeatTimer: null,
     bridge: {
       online: false,
       cwd: "",
@@ -80,6 +93,7 @@
     } catch {}
     try {
       chrome.storage?.local?.get([CUSTOM_TAGS_STORAGE_KEY], res => {
+        try {
         const list = res?.[CUSTOM_TAGS_STORAGE_KEY];
         if (Array.isArray(list)) {
           state.customTags = list
@@ -94,6 +108,7 @@
           } catch {}
           renderCustomTagChips();
         }
+        } catch {}
       });
     } catch {}
   }
@@ -859,7 +874,7 @@
         <div class="pop-chips" id="pop-chips"></div>
         <textarea id="pop-input" placeholder="输入修改意见…"></textarea>
         <div class="pop-footer">
-          <span class="pop-hint">⌘↵ 发送给 Agent · Esc 取消</span>
+          <span class="pop-hint">⌘↵ 暂存到 Herdr · Esc 取消</span>
           <div style="display:flex;gap:6px;flex-shrink:0;">
             <button class="btn" id="pop-cancel-btn">Cancel</button>
             <button class="btn btn-primary" id="pop-save-btn">Save #1</button>
@@ -948,11 +963,11 @@
         cancelDraft();
         return;
       }
-      // Cmd+Enter / Ctrl+Enter saves & dispatches immediately; normal Enter inserts a newline!
+      // Cmd+Enter stages for Herdr confirmation; normal Enter inserts a newline!
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         commitDraft({ skipSilentStage: true });
-        dispatchToHerdr(e.shiftKey ? "send" : "paste");
+        dispatchToHerdr("stage");
       }
     });
 
@@ -978,13 +993,17 @@
       e.stopPropagation();
       clearTimeout(state.silentStageTimer);
       if (state.editingDraft) commitDraft({ skipSilentStage: true });
-      dispatchToHerdr("paste");
+      dispatchToHerdr("stage");
     });
+    els.btnPaste.textContent = '暂存到 Herdr ⌘↵';
+    els.btnPaste.title = '暂存截图与标注；在 Herdr 确认后才能发送';
+    els.btnSend.hidden = true;
+    els.btnSend.style.display = 'none';
     els.btnSend.addEventListener("click", e => {
       e.stopPropagation();
       clearTimeout(state.silentStageTimer);
       if (state.editingDraft) commitDraft({ skipSilentStage: true });
-      dispatchToHerdr("send");
+      dispatchToHerdr("stage");
     });
     els.btnCopy.addEventListener("click", e => {
       e.stopPropagation();
@@ -1097,10 +1116,12 @@
     cancelDraft();
     renderDockAndPins();
     if (notifyServer) {
-      chrome.runtime.sendMessage(
+      transport.send(
         {
-          type: "HERDR_CLEAR_AGENT_ANNOTATIONS",
-          targetTerminal: agent,
+          type: "HERDR_CAPTURE_AND_SEND",
+          activationNonce: state.activationNonce,
+          captureScreenshot: false,
+          payload: { action: 'silent_stage', url: location.href, title: document.title, globalNote: '', items: [], targetTerminal: agent },
         },
         () => {},
       );
@@ -1119,8 +1140,8 @@
   }
 
   function refreshBridgeStatus() {
-    chrome.runtime.sendMessage({ type: "HERDR_BRIDGE_STATUS" }, res => {
-      if (chrome.runtime.lastError || !res?.ok || !res.data?.ok) {
+    transport.send({ type: "HERDR_BRIDGE_STATUS", activationNonce: state.activationNonce }, res => {
+      if (!res?.ok || !res.data?.ok) {
         state.bridge.online = false;
         renderBridgeSelect();
         return;
@@ -1258,10 +1279,14 @@
     const dimStr = `${Math.round(r.width)}×${Math.round(r.height)}`;
 
     els.hoverLabel.innerHTML = `
-      <span class="hover-tag mono">${tagStr}</span>
-      ${shortSrc ? `<span class="hover-src mono">${shortSrc}</span>` : ""}
-      <span class="hover-dim mono">${dimStr}</span>
+      <span class="hover-tag mono"></span>
+      <span class="hover-src mono"></span>
+      <span class="hover-dim mono"></span>
     `;
+    els.hoverLabel.querySelector('.hover-tag').textContent = tagStr;
+    els.hoverLabel.querySelector('.hover-src').textContent = shortSrc;
+    els.hoverLabel.querySelector('.hover-src').hidden = !shortSrc;
+    els.hoverLabel.querySelector('.hover-dim').textContent = dimStr;
     els.hoverLabel.style.display = "flex";
     const labelTop =
       r.top >= 30 ? r.top - 28 : Math.min(window.innerHeight - 28, r.bottom + 6);
@@ -1444,10 +1469,13 @@
         row.className = "drawer-item";
         const shortSrc = formatShortSource(item.source);
         row.innerHTML = `
-          <span class="pop-badge">#${idx + 1}</span>
-          <span class="drawer-item-note">${item.note || ""}</span>
-          <span class="drawer-item-meta mono">${shortSrc || item.selector || ""}</span>
+          <span class="pop-badge"></span>
+          <span class="drawer-item-note"></span>
+          <span class="drawer-item-meta mono"></span>
         `;
+        row.querySelector('.pop-badge').textContent = `#${idx + 1}`;
+        row.querySelector('.drawer-item-note').textContent = item.note || '';
+        row.querySelector('.drawer-item-meta').textContent = shortSrc || item.selector || '';
         const editBtn = document.createElement("button");
         editBtn.className = "btn";
         editBtn.style.cssText = "padding:3px 8px;font-size:11px;";
@@ -1625,7 +1653,8 @@
     if (!opts.silent) {
       clearTimeout(state.silentStageTimer);
     }
-    if (state.sending && opts.silent) return;
+    if (!['stage', 'silent_stage'].includes(action)) return;
+    if (state.sending) return;
     const items = serializeItemsForTransport();
     const targetTerminal = effectiveAgentTerminal();
 
@@ -1638,6 +1667,7 @@
       state.sending = true;
     }
     renderDockAndPins();
+    state.sending = true;
 
     els.root.setAttribute("data-capturing", "true");
     await new Promise(r =>
@@ -1659,43 +1689,34 @@
       items,
     };
 
-    chrome.runtime.sendMessage(
+    const sent = transport.send(
       {
         type: "HERDR_CAPTURE_AND_SEND",
-        captureScreenshot: items.length > 0,
+        activationNonce: state.activationNonce,
+        captureScreenshot: !opts.silent && items.length > 0,
         payload,
       },
       async res => {
         els.root.removeAttribute("data-capturing");
         state.sending = false;
         if (opts.silent) return;
-        if (chrome.runtime.lastError || !res?.ok) {
+        if (!res?.ok) {
           const md = buildLocalMarkdown(items);
           try {
             await navigator.clipboard.writeText(md);
           } catch {}
-          showToast(
-            "Herdr Bridge 未连接 — 已将标注 Markdown 复制到剪贴板！",
-            3500,
-          );
-          return;
-        }
-
-        // Auto-clear annotations after sending to Agent!
-        if (action === "paste" || action === "send") {
-          const sentCount = items.length;
-          clearCurrentAgentAnnotations(false);
-          const label =
-            action === "send"
-              ? `✓ 已发送 ${sentCount} 条标注到 Agent 并开始执行（列表已清空）`
-              : `✓ 已粘贴 ${sentCount} 条标注与截图到 Agent 输入框（列表已清空）`;
-          showToast(label, 3000);
+          showToast(res?.error || 'Herdr 未连接 — 已复制 Markdown，请检查配对；未发送至 Agent', 3500);
           return;
         }
 
         showToast(`✓ 已同步 ${items.length} 条标注到 Herdr Review`, 2600);
       },
     );
+    if (!sent) {
+      els.root.removeAttribute("data-capturing");
+      state.sending = false;
+      showToast('Herdr 插件已更新，请刷新页面后重新开启标注', 3500);
+    }
   }
 
   // Event listeners on document when annotator is active
@@ -1888,8 +1909,8 @@
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       e.stopPropagation();
-      if (state.editingDraft) commitDraft();
-      dispatchToHerdr(e.shiftKey ? "send" : "paste");
+      if (state.editingDraft) commitDraft({ skipSilentStage: true });
+      dispatchToHerdr("stage");
       return;
     }
 
@@ -1926,9 +1947,20 @@
   }
 
   function setAnnotatorActive(next) {
+    if (state.disposed) return;
     ensureShadowUI();
     state.active = Boolean(next);
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
     if (state.active) {
+      state.heartbeatTimer = setInterval(() => {
+        transport.send({ type: 'HERDR_BRIDGE_HEARTBEAT', activationNonce: state.activationNonce }, res => {
+          if (!res?.ok) {
+            state.bridge.online = false;
+            renderBridgeSelect();
+          }
+        });
+      }, 20000);
       state.currentUrl = location.href;
       els.root.setAttribute("data-hidden", "false");
       refreshBridgeStatus();
@@ -1977,26 +2009,69 @@
       setAnnotatorActive(!state.active);
     }
   }
-  window.addEventListener("keydown", onGlobalShortcut, true);
+  // Activation is allowed only through the extension worker, not webpage keys.
 
-  window.__herdrAnnotatorCleanup = function () {
-    setAnnotatorActive(false);
+  function removeAnnotatorListeners() {
+    window.removeEventListener("mousemove", onMouseMove, true);
+    window.removeEventListener("mousedown", onMouseDown, true);
+    window.removeEventListener("mouseup", onMouseUp, true);
+    window.removeEventListener("click", onClickCapture, true);
+    window.removeEventListener("wheel", onWheel, true);
+    window.removeEventListener("keydown", onKeyDown, true);
+    window.removeEventListener("scroll", onScrollOrResize, true);
+    window.removeEventListener("resize", onScrollOrResize, true);
+    window.removeEventListener("popstate", checkUrlChange, true);
+    window.removeEventListener("hashchange", checkUrlChange, true);
     window.removeEventListener("keydown", onGlobalShortcut, true);
-    if (hostEl && hostEl.parentNode) {
-      hostEl.parentNode.removeChild(hostEl);
-    }
+    window.removeEventListener("__herdr_inspect_response", onInspectResponse);
+  }
+
+  // Final stop for this copy of the page script: the extension that injected it
+  // is gone (reload, update, disable) or a newer copy took over.
+  function disposeAnnotator() {
+    if (state.disposed) return;
+    state.disposed = true;
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+    clearTimeout(state.silentStageTimer);
+    clearTimeout(state.toastTimer);
+    state.active = false;
+    state.sending = false;
+    state.editingDraft = null;
+    pendingInspects.clear();
+    removeAnnotatorListeners();
+    try {
+      chrome.runtime?.onMessage?.removeListener?.(onRuntimeMessage);
+    } catch {}
+    if (hostEl && hostEl.parentNode) hostEl.parentNode.removeChild(hostEl);
     hostEl = null;
     shadow = null;
-  };
+    els = {};
+    transport.dispose();
+  }
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  window.__herdrAnnotatorCleanup = disposeAnnotator;
+
+  function onRuntimeMessage(msg, sender, sendResponse) {
+    if (state.disposed) return;
+    // A replaced extension makes this getter throw; treat that as the end of this copy.
+    try {
+      if (sender.id !== chrome.runtime.id) return;
+    } catch {
+      disposeAnnotator();
+      return;
+    }
     if (msg?.type === "HERDR_PING_VERSION") {
       sendResponse({ ok: true, version: SCRIPT_VERSION });
       return;
     }
-    if (msg?.type === "HERDR_TOGGLE_ANNOTATOR") {
+    if (msg?.type === "HERDR_TOGGLE_ANNOTATOR" && msg.version === SCRIPT_VERSION && typeof msg.activationNonce === 'string') {
+      state.activationNonce = msg.activationNonce;
       setAnnotatorActive(!state.active);
       sendResponse({ ok: true, active: state.active, version: SCRIPT_VERSION });
     }
-  });
+  }
+  try {
+    chrome.runtime.onMessage.addListener(onRuntimeMessage);
+  } catch {}
 })();
