@@ -1,1050 +1,330 @@
 #!/usr/bin/env node
-import http from "node:http";
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import { spawn, execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
+// Local-only Review transport. Browsers can stage data, never drive terminals.
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { installChromeExtension } from './chrome-install.mjs';
 
-const BRIDGE_VERSION = "1.5.0";
+const VERSION = '2.0.0';
 const PORT = Number(process.env.HERDR_ANNOTATE_PORT || 17501);
-const HOST = "127.0.0.1";
-const MAX_BATCHES = 30;
-const EXPECTED_EXT_ID = "gmgfppipckmjcfgfhlcokjpjmmobbopn";
-let pendingExtReload = false;
+const HOST = '127.0.0.1';
+const EXT_ID = 'gmgfppipckmjcfgfhlcokjpjmmobbopn';
+const MAX_BODY = 12 * 1024 * 1024;
+const MAX_SHOT = 8 * 1024 * 1024;
+const SHOT_QUOTA = 128 * 1024 * 1024;
+const TTL = 7 * 86400000;
+const secret = () => randomBytes(32).toString('hex');
+const fail = (status, message) => Object.assign(new Error(message), { status });
+const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
-const __filename = fileURLToPath(import.meta.url);
-
-function parseArgs(argv) {
-  const out = {
-    mode: "serve",
-    appHome:
-      process.env.HERDR_APP_HOME || path.join(os.homedir(), ".config", "herdr-app"),
-  };
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--daemon") out.mode = "daemon";
-    else if (a === "--serve") out.mode = "serve";
-    else if (a === "--check-ext") out.mode = "check-ext";
-    else if (a === "--install-ext") out.mode = "install-ext";
-    else if (a === "--update-ext") out.mode = "update-ext";
-    else if (a === "--app-home" && argv[i + 1]) {
-      out.appHome = argv[++i];
-    }
+function plain(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+function string(value, max, fallback = '') {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'string' || value.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) throw fail(400, 'Invalid text field');
+  return value;
+}
+function readJSON(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) {
+    if (e.code === 'ENOENT') return fallback;
+    throw fail(500, 'Invalid local state');
   }
-  return out;
 }
-
-function getExtensionDir(appHome) {
-  return path.join(appHome, "mods", "ide-review", "chrome-extension");
-}
-
-function getBundledExtensionVersion(appHome) {
-  const manifestPath = path.join(getExtensionDir(appHome), "manifest.json");
-  const m = readJsonSafe(manifestPath, null);
-  return String(m?.version || "1.0.0");
-}
-
-function compareVersions(v1, v2) {
-  const a = String(v1 || "0")
-    .split(".")
-    .map(n => Number(n) || 0);
-  const b = String(v2 || "0")
-    .split(".")
-    .map(n => Number(n) || 0);
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const x = a[i] || 0;
-    const y = b[i] || 0;
-    if (x > y) return 1;
-    if (x < y) return -1;
+function noLink(file) {
+  let current = path.resolve(file);
+  for (;;) {
+    try { if (fs.lstatSync(current).isSymbolicLink()) throw fail(400, 'Symlinks are not allowed'); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
   }
-  return 0;
 }
-
-function ensureDirs(appHome) {
-  const baseDir = path.join(appHome, "data", "annotations");
-  const shotsDir = path.join(baseDir, "shots");
-  fs.mkdirSync(shotsDir, { recursive: true });
-  const queueFile = path.join(baseDir, "queue.json");
-  if (!fs.existsSync(queueFile)) {
-    fs.writeFileSync(queueFile, JSON.stringify({ batches: [] }, null, 2));
-  }
-  return {
-    baseDir,
-    shotsDir,
-    queueFile,
-    commandFile: path.join(baseDir, "command.json"),
-    contextFile: path.join(baseDir, "context.json"),
-    bridgeFile: path.join(baseDir, "bridge.json"),
-    extStatusFile: path.join(baseDir, "ext-status.json"),
-  };
-}
-
-function readJsonSafe(filePath, fallback) {
+function atomic(file, data) {
+  noLink(file);
+  const tmp = `${file}.tmp-${randomUUID()}`;
   try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return fallback;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, file);
+    fs.chmodSync(file, 0o600);
+  } finally { try { fs.unlinkSync(tmp); } catch {} }
+}
+function dirs(home) {
+  const base = path.join(home, 'data', 'annotations');
+  const security = path.join(base, 'security');
+  const shots = path.join(base, 'shots');
+  for (const dir of [base, security, shots]) {
+    noLink(dir); fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.chmodSync(dir, 0o700);
   }
+  return { base, shots, security, auth: path.join(security, 'credentials.json'), queue: path.join(base, 'queue.json'), context: path.join(base, 'context.json') };
 }
-
-function writeJsonAtomic(filePath, data) {
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, filePath);
+function credentials(p, create = false) {
+  noLink(p.auth);
+  let data = readJSON(p.auth, null);
+  if (!data && create) { data = { admin: secret(), clients: [] }; atomic(p.auth, data); }
+  if (!data?.admin || !Array.isArray(data.clients)) throw fail(500, 'Start the bridge first');
+  fs.chmodSync(p.auth, 0o600);
+  return data;
 }
-
-function scanBrowserProfilesForExtension(appHome) {
-  const extDir = getExtensionDir(appHome);
-  const home = os.homedir();
-  const browserRoots = [
-    path.join(home, "Library", "Application Support", "Google", "Chrome"),
-    path.join(home, "Library", "Application Support", "Google", "Chrome Canary"),
-    path.join(home, "Library", "Application Support", "Arc", "User Data"),
-    path.join(
-      home,
-      "Library",
-      "Application Support",
-      "BraveSoftware",
-      "Brave-Browser",
-    ),
-    path.join(home, "Library", "Application Support", "Microsoft Edge"),
-    path.join(home, ".config", "google-chrome"),
-    path.join(home, ".config", "chromium"),
-  ];
-
-  for (const root of browserRoots) {
-    if (!fs.existsSync(root)) continue;
-    let entries = [];
-    try {
-      entries = fs.readdirSync(root, { withFileTypes: true });
-    } catch {
-      continue;
+function queueRead(p) {
+  noLink(p.queue);
+  const q = readJSON(p.queue, { revision: 0, batches: [] });
+  if (!Array.isArray(q.batches)) throw fail(500, 'Invalid queue');
+  // Do not trust paths in old persisted queues. Keep only server-owned shot names.
+  q.batches = q.batches.map(b => {
+    const { screenshotAbsPath, screenshotRelPath, ...rest } = b;
+    if (/^shot-[0-9a-f-]{36}\.png$/.test(b.shot || '')) {
+      rest.shot = b.shot;
+      rest.screenshotAbsPath = path.join(p.shots, b.shot);
+      rest.screenshotRelPath = `data/annotations/shots/${b.shot}`;
     }
-
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name !== "Default" && !entry.name.startsWith("Profile ")) {
-        continue;
-      }
-      const profileDir = path.join(root, entry.name);
-      for (const prefName of ["Secure Preferences", "Preferences"]) {
-        const prefPath = path.join(profileDir, prefName);
-        if (!fs.existsSync(prefPath)) continue;
-        try {
-          const data = JSON.parse(fs.readFileSync(prefPath, "utf8"));
-          const settings = data?.extensions?.settings;
-          if (!settings || typeof settings !== "object") continue;
-
-          for (const [id, info] of Object.entries(settings)) {
-            if (!info || typeof info !== "object") continue;
-            const extPath = String(info.path || "");
-            const name = String(info.manifest?.name || "");
-            const isMatch =
-              id === EXPECTED_EXT_ID ||
-              name === "Herdr UI Review" ||
-              name === "Herdr Browser Annotator" ||
-              extPath === extDir ||
-              (extPath.endsWith("chrome-extension") &&
-                (extPath.includes("ide-review") ||
-                  extPath.includes("ide-annotate") ||
-                  extPath.includes("herdr-mods")));
-
-            if (isMatch) {
-              const enabled = info.state === undefined ? true : info.state === 1;
-              return {
-                installedInProfile: true,
-                enabled,
-                extId: id,
-                version: info.manifest?.version || "1.0.0",
-                installedPath: extPath,
-                profile: `${path.basename(root)}/${entry.name}`,
-              };
-            }
-          }
-        } catch {}
-      }
-    }
+    return rest;
+  });
+  q.revision = Number.isSafeInteger(q.revision) ? q.revision : 0;
+  return q;
+}
+function cleanup(p, q) {
+  const now = Date.now();
+  q.batches = q.batches.filter(b => now - (b.createdAt || 0) <= TTL).slice(0, 30);
+  const used = new Set(q.batches.map(b => b.shot).filter(Boolean));
+  let bytes = 0;
+  for (const name of fs.readdirSync(p.shots)) {
+    const file = path.join(p.shots, name);
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) throw fail(400, 'Symlinks are not allowed');
+    if (!/^shot-[0-9a-f-]{36}\.png$/.test(name)) continue;
+    if (!used.has(name) || now - stat.mtimeMs > TTL) fs.unlinkSync(file);
+    else bytes += stat.size;
   }
-
-  return {
-    installedInProfile: false,
-    enabled: false,
-    extId: EXPECTED_EXT_ID,
-    version: null,
-    installedPath: null,
-    profile: null,
-  };
+  return bytes;
 }
-
-function computeAndSaveExtStatus(appHome, heartbeatUpdate = null) {
-  const paths = ensureDirs(appHome);
-  const prev = readJsonSafe(paths.extStatusFile, {});
-  const profileScan = scanBrowserProfilesForExtension(appHome);
-  const extDir = getExtensionDir(appHome);
-  const bundledVersion = getBundledExtensionVersion(appHome);
-
-  const rawLastSeen = heartbeatUpdate?.lastSeenAt ?? prev.lastSeenAt ?? null;
-  // If it was previously recorded in Chrome's profile and is now gone from Chrome's profile,
-  // the user just uninstalled it in Chrome!
-  const wasUninstalledFromProfile =
-    !heartbeatUpdate &&
-    Boolean(prev.installedInProfile) &&
-    !profileScan.installedInProfile;
-
-  const justInstalledGrace =
-    !wasUninstalledFromProfile &&
-    (Boolean(heartbeatUpdate) ||
-      (!prev.installedInProfile &&
-        Boolean(rawLastSeen) &&
-        Date.now() - rawLastSeen < 30000));
-
-  const installed = profileScan.installedInProfile || justInstalledGrace;
-  const lastSeenAt = installed ? rawLastSeen : null;
-  const connectedNow =
-    installed &&
-    (Boolean(heartbeatUpdate) ||
-      (Boolean(lastSeenAt) && Date.now() - lastSeenAt < 1000 * 60));
-
-  const heartbeatVersion = installed
-    ? heartbeatUpdate?.version || prev.heartbeatVersion || null
-    : null;
-  const installedVersion = installed
-    ? heartbeatVersion || profileScan.version || prev.installedVersion || null
-    : null;
-
-  const pathMismatch =
-    installed &&
-    Boolean(profileScan.installedPath) &&
-    profileScan.installedPath !== extDir;
-  const needsUpdate =
-    installed &&
-    (compareVersions(bundledVersion, installedVersion || "0.0.0") > 0 ||
-      pathMismatch);
-
-  const next = {
-    installed,
-    installedInProfile: profileScan.installedInProfile,
-    enabled: installed
-      ? profileScan.installedInProfile
-        ? profileScan.enabled
-        : true
-      : false,
-    connected: connectedNow,
-    extId:
-      heartbeatUpdate?.extId ||
-      profileScan.extId ||
-      prev.extId ||
-      EXPECTED_EXT_ID,
-    version: installedVersion || bundledVersion,
-    heartbeatVersion,
-    installedVersion,
-    bundledVersion,
-    needsUpdate,
-    installedPath: installed
-      ? profileScan.installedPath || extDir
-      : null,
-    extensionDir: extDir,
-    profile: installed ? profileScan.profile || prev.profile || null : null,
-    lastSeenAt,
-    checkedAt: Date.now(),
-  };
-
-  const prevKey = JSON.stringify({
-    installed: prev.installed,
-    connected: prev.connected,
-    extId: prev.extId,
-    installedVersion: prev.installedVersion,
-    bundledVersion: prev.bundledVersion,
-    needsUpdate: prev.needsUpdate,
-    profile: prev.profile,
-  });
-  const nextKey = JSON.stringify({
-    installed: next.installed,
-    connected: next.connected,
-    extId: next.extId,
-    installedVersion: next.installedVersion,
-    bundledVersion: next.bundledVersion,
-    needsUpdate: next.needsUpdate,
-    profile: next.profile,
-  });
-
-  if (
-    prevKey !== nextKey ||
-    heartbeatUpdate ||
-    !fs.existsSync(paths.extStatusFile)
-  ) {
-    writeJsonAtomic(paths.extStatusFile, next);
-  }
-  return next;
-}
-
-function copyToClipboardMac(text) {
-  return new Promise(resolve => {
-    const proc = spawn("pbcopy");
-    proc.on("error", () => resolve(false));
-    proc.on("close", code => resolve(code === 0));
-    proc.stdin.write(text);
-    proc.stdin.end();
-  });
-}
-
-function runAppleScript(script, args = [], timeoutMs = 12000) {
-  return new Promise(resolve => {
-    execFile(
-      "osascript",
-      ["-e", script, ...args],
-      { timeout: timeoutMs },
-      (err, stdout, stderr) => {
-        resolve({
-          ok: !err,
-          stdout: String(stdout || "").trim(),
-          stderr: String(stderr || "").trim(),
-        });
-      },
-    );
-  });
-}
-
-async function installChromeExtension(appHome) {
-  const extDir = getExtensionDir(appHome);
-  if (!fs.existsSync(extDir)) {
-    return {
-      ok: false,
-      error: `Extension folder missing at ${extDir}`,
+function annotation(body) {
+  if (!plain(body)) throw fail(400, 'Invalid annotation');
+  const allowed = ['action', 'url', 'title', 'globalNote', 'items', 'viewport', 'targetTerminal', 'requestId', 'screenshotDataUrl', 'replaceSameUrl'];
+  if (Object.keys(body).some(k => !allowed.includes(k))) throw fail(400, 'Unknown annotation field');
+  if (!['stage', 'silent_stage'].includes(body.action)) throw fail(400, 'Only staging is allowed');
+  if (!Array.isArray(body.items) || body.items.length > 100) throw fail(400, 'Invalid annotation count');
+  const items = body.items.map((it, i) => {
+    if (!plain(it)) throw fail(400, 'Invalid item');
+    const source = it.source == null ? null : {
+      framework: string(it.source.framework, 64), fileName: string(it.source.fileName, 2048),
+      componentPath: string(it.source.componentPath, 2048),
+      lineNumber: Number.isSafeInteger(it.source.lineNumber) && it.source.lineNumber > 0 ? it.source.lineNumber : null,
     };
+    const styles = {};
+    if (plain(it.styles)) for (const [key, val] of Object.entries(it.styles).slice(0, 30)) styles[string(key, 64)] = string(val, 512);
+    const rect = plain(it.rect) && ['x','y','width','height'].every(k => Number.isFinite(it.rect[k]) && Math.abs(it.rect[k]) <= 100000)
+      ? { x: it.rect.x, y: it.rect.y, width: it.rect.width, height: it.rect.height } : null;
+    return { id: randomUUID(), index: i + 1, enabled: true, kind: ['element','area','selection'].includes(it.kind) ? it.kind : 'element',
+      note: string(it.note, 4096), tagName: string(it.tagName, 64), selector: string(it.selector, 2048),
+      text: string(it.text, 4096), selectedText: string(it.selectedText, 4096), htmlSnippet: string(it.htmlSnippet, 4096), source, styles, rect, groupedElements: [] };
+  });
+  if (Buffer.byteLength(JSON.stringify(items)) > 65536) throw fail(413, 'Annotation metadata too large');
+  const url = string(body.url, 2048);
+  try { if (!['http:', 'https:'].includes(new URL(url).protocol)) throw new Error(); } catch { throw fail(400, 'Invalid page URL'); }
+  const requestId = string(body.requestId, 128);
+  if (!/^[a-zA-Z0-9_-]{8,128}$/.test(requestId)) throw fail(400, 'Invalid request identifier');
+  let screenshot = null;
+  if (body.screenshotDataUrl != null) {
+    if (typeof body.screenshotDataUrl !== 'string' || !/^data:image\/png;base64,[a-zA-Z0-9+/]*={0,2}$/.test(body.screenshotDataUrl)) throw fail(400, 'Invalid PNG');
+    screenshot = Buffer.from(body.screenshotDataUrl.split(',')[1], 'base64');
+    if (screenshot.length > MAX_SHOT) throw fail(413, 'Screenshot too large');
+    if (screenshot.length < 24 || !screenshot.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) || screenshot.toString('ascii', 12, 16) !== 'IHDR') throw fail(400, 'Invalid PNG');
+    const w = screenshot.readUInt32BE(16), h = screenshot.readUInt32BE(20);
+    if (!w || !h || w > 16000 || h > 16000 || w * h > 64000000) throw fail(400, 'Invalid image dimensions');
   }
-
-  const preStatus = computeAndSaveExtStatus(appHome);
-  const alreadyAtTargetDir =
-    preStatus.installedInProfile && preStatus.installedPath === extDir;
-
-  // Always put the exact extension path onto clipboard first
-  await copyToClipboardMac(extDir);
-
-  const appleScript = `
-on collectControls(el, depth)
-  if depth > 7 then return {}
-  set out to {}
-  tell application "System Events"
-    try
-      set childrenList to UI elements of el
-    on error
-      return {}
-    end try
-    repeat with c in childrenList
-      try
-        set r to role of c
-        if r is "AXButton" or r is "AXCheckBox" then
-          set end of out to (contents of c)
-        else if r is "AXGroup" then
-          set sub to my collectControls(contents of c, depth + 1)
-          set out to out & sub
-        end if
-      end try
-    end repeat
-  end tell
-  return out
-end collectControls
-
-on findWebArea(winEl)
-  tell application "System Events"
-    try
-      set g4 to group 1 of group 1 of group 1 of group 1 of winEl
-      set webContainer to UI element 2 of g4
-      repeat with g in groups of webContainer
-        repeat with sa in scroll areas of g
-          repeat with wa in UI elements of sa
-            if (role of wa) is "AXWebArea" and ((name of wa as text) contains "扩展程序" or (name of wa as text) contains "Extensions") then
-              return contents of wa
-            end if
-          end repeat
-        end repeat
-      end repeat
-    end try
-  end tell
-  return missing value
-end findWebArea
-
-on run argv
-  set onlyReload to (item 1 of argv) is "reload"
-
-  tell application "Google Chrome"
-    activate
-    if (count of windows) is 0 or (mode of front window) is not "normal" then
-      make new window
-    end if
-    set w to front window
-    set foundTab to false
-    set tabIdx to 1
-    repeat with t in tabs of w
-      if URL of t starts with "chrome://extensions" then
-        set active tab index of w to tabIdx
-        set foundTab to true
-        exit repeat
-      end if
-      set tabIdx to tabIdx + 1
-    end repeat
-    if not foundTab then
-      tell w to make new tab at end of tabs with properties {URL:"chrome://extensions/"}
-    end if
-  end tell
-
-  delay 0.7
-
-  try
-    tell application "System Events"
-      tell process "Google Chrome"
-        set frontmost to true
-        try
-          set value of attribute "AXEnhancedUserInterface" to true
-        end try
-        delay 0.4
-
-        set targetWin to window 1
-        try
-          perform action "AXRaise" of targetWin
-        end try
-
-        set wa to my findWebArea(targetWin)
-        set elems to {}
-        if wa is not missing value then
-          set elems to my collectControls(wa, 0)
-        end if
-
-        -- If extension is already loaded from targetDir, click Reload & Update buttons directly
-        if onlyReload and (count of elems) > 0 then
-          set clickedReload to false
-          set sawRemove to false
-          repeat with el in elems
-            try
-              if (role of el) is "AXButton" then
-                set n to (name of el) as text
-                if n is "更新" or n is "Update" then
-                  click el
-                  set clickedReload to true
-                else if n is "移除" or n is "Remove" then
-                  set sawRemove to true
-                else if sawRemove and (n is "重新加载" or n is "Reload") then
-                  click el
-                  set clickedReload to true
-                  set sawRemove to false
-                end if
-              end if
-            end try
-          end repeat
-          if clickedReload then
-            return "AUTO_RELOADED"
-          end if
-        end if
-
-        -- Otherwise toggle Developer Mode if needed and click Load Unpacked
-        if (count of sheets of targetWin) is 0 then
-          set loadBtn to missing value
-          set devSwitch to missing value
-          repeat with el in elems
-            try
-              set r to role of el
-              set n to (name of el) as text
-              if r is "AXCheckBox" and (n contains "开发者模式" or n contains "Developer mode") then
-                set devSwitch to el
-              else if r is "AXButton" and (n contains "加载未打包的扩展程序" or n contains "加载已解压的扩展程序" or n contains "Load unpacked") then
-                set loadBtn to el
-              end if
-            end try
-          end repeat
-
-          if devSwitch is not missing value then
-            try
-              if (value of devSwitch as integer) is 0 then
-                click devSwitch
-                delay 0.45
-              end if
-            end try
-          end if
-
-          if loadBtn is missing value and wa is not missing value then
-            set elems2 to my collectControls(wa, 0)
-            repeat with el in elems2
-              try
-                set r2 to role of el
-                set n2 to (name of el) as text
-                if r2 is "AXButton" and (n2 contains "加载未打包的扩展程序" or n2 contains "加载已解压的扩展程序" or n2 contains "Load unpacked") then
-                  set loadBtn to el
-                  exit repeat
-                end if
-              end try
-            end repeat
-          end if
-
-          if loadBtn is not missing value then
-            click loadBtn
-            delay 0.7
-          end if
-        end if
-
-        -- Handle the macOS Open Folder sheet on targetWin
-        if (count of sheets of targetWin) > 0 then
-          if (count of sheets of sheet 1 of targetWin) is 0 then
-            keystroke "g" using {command down, shift down}
-            delay 0.55
-          end if
-
-          if (count of sheets of sheet 1 of targetWin) > 0 then
-            set focused of text field 1 of sheet 1 of sheet 1 of targetWin to true
-            delay 0.15
-            keystroke "a" using {command down}
-            delay 0.1
-            keystroke "v" using {command down}
-            delay 0.5
-            key code 36
-            delay 0.65
-          end if
-
-          if (count of sheets of targetWin) > 0 then
-            repeat with b in buttons of splitter group 1 of sheet 1 of targetWin
-              set bn to (name of b) as text
-              if bn is "选择" or bn is "Select" or bn is "Open" or bn is "打开" then
-                click b
-                exit repeat
-              end if
-            end repeat
-            delay 0.6
-          end if
-          return "AUTO_INSTALLED"
-        end if
-      end tell
-    end tell
-  on error errMsg
-    return "FALLBACK:" & errMsg
-  end try
-  return "OPENED_EXTENSIONS_PAGE"
-end run
-`;
-
-  const osaRes = await runAppleScript(
-    appleScript,
-    [alreadyAtTargetDir ? "reload" : "install"],
-    12000,
-  );
-
-  // Give Chrome a moment to register the unpacked extension & fire onInstalled heartbeat
-  await new Promise(r => setTimeout(r, 900));
-  const status = computeAndSaveExtStatus(appHome);
-
-  if (
-    status.installed ||
-    osaRes.stdout === "AUTO_INSTALLED" ||
-    osaRes.stdout === "AUTO_RELOADED"
-  ) {
-    return {
-      ok: true,
-      mode: "auto",
-      status,
-      extensionDir: extDir,
-      message: "Chrome extension installed/updated automatically!",
-    };
+  return { url, title: string(body.title, 1024), globalNote: string(body.globalNote, 16384), targetTerminal: string(body.targetTerminal, 128, 'default'), requestId, items, screenshot };
+}
+async function bodyRead(req) {
+  if (!(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) throw fail(415, 'JSON required');
+  const chunks = []; let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_BODY) throw fail(413, 'Request too large');
+    chunks.push(chunk);
   }
-
-  // Fallback: also reveal the folder in Finder right next to chrome://extensions
-  execFile("open", ["-R", extDir], () => {});
-
-  return {
-    ok: true,
-    mode: "assisted",
-    status,
-    extensionDir: extDir,
-    message:
-      "Opened chrome://extensions & copied extension path to clipboard (drag the highlighted folder into Chrome or click Load unpacked → ⌘⇧G → ⌘V).",
-  };
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw fail(400, 'Invalid JSON'); }
 }
 
-function httpGetJson(url, timeoutMs = 600) {
-  return new Promise(resolve => {
-    const req = http.get(url, { timeout: timeoutMs }, res => {
-      let raw = "";
-      res.setEncoding("utf8");
-      res.on("data", chunk => (raw += chunk));
-      res.on("end", () => {
-        try {
-          resolve(JSON.parse(raw));
-        } catch {
-          resolve(null);
-        }
-      });
-    });
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(null);
-    });
-  });
-}
-
-function httpPostJson(url, body = {}, timeoutMs = 600) {
-  return new Promise(resolve => {
-    const payload = JSON.stringify(body);
-    const u = new URL(url);
-    const req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname,
-        method: "POST",
-        timeout: timeoutMs,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      },
-      res => {
-        let raw = "";
-        res.on("data", c => (raw += c));
-        res.on("end", () => resolve(raw));
-      },
-    );
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(null);
-    });
-    req.write(payload);
-    req.end();
-  });
-}
-
-function queryHcTerminals() {
-  return new Promise(resolve => {
-    execFile("hc", ["ls", "--json"], { timeout: 1500 }, (err, stdout) => {
-      if (err || !stdout) return resolve([]);
-      try {
-        const parsed = JSON.parse(stdout);
-        const list = Array.isArray(parsed)
-          ? parsed
-          : Array.isArray(parsed?.terminals)
-            ? parsed.terminals
-            : [];
-        resolve(list);
-      } catch {
-        resolve([]);
-      }
-    });
-  });
-}
-
-async function runDaemonBootstrap(appHome) {
-  ensureDirs(appHome);
-  computeAndSaveExtStatus(appHome);
-  const ping = await httpGetJson(`http://${HOST}:${PORT}/api/ping`, 450);
-  if (ping?.ok && ping?.version === BRIDGE_VERSION) {
-    process.exit(0);
-  }
-  if (ping?.ok) {
-    await httpPostJson(`http://${HOST}:${PORT}/api/shutdown`, {}, 450);
-    await new Promise(r => setTimeout(r, 120));
-  }
-  const child = spawn(
-    process.execPath,
-    [__filename, "--serve", "--app-home", appHome],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: { ...process.env, HERDR_APP_HOME: appHome },
-    },
-  );
-  child.unref();
-  process.exit(0);
-}
-
-function sendCorsHeaders(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Private-Network", "true");
-}
-
-function sendJson(res, status, obj) {
-  sendCorsHeaders(res);
-  const body = JSON.stringify(obj);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-function readRequestBody(req, maxBytes = 25 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on("data", chunk => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        req.destroy();
-        reject(new Error("Payload too large"));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      try {
-        const str = Buffer.concat(chunks).toString("utf8");
-        resolve(str ? JSON.parse(str) : {});
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", reject);
-  });
-}
-
-function startServer(appHome) {
-  const paths = ensureDirs(appHome);
-  computeAndSaveExtStatus(appHome);
-
-  const server = http.createServer(async (req, res) => {
-    sendCorsHeaders(res);
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    const urlObj = new URL(req.url || "/", `http://${HOST}:${PORT}`);
-    const pathname = urlObj.pathname;
-
+function server(home) {
+  const p = dirs(home); let auth = credentials(p, true); let pairing = null;
+  const initialQueue = queueRead(p); cleanup(p, initialQueue); atomic(p.queue, initialQueue);
+  let chain = Promise.resolve(); const limits = new Map();
+  const serial = fn => { const task = chain.then(fn); chain = task.catch(() => {}); return task; };
+  const srv = http.createServer(async (req, res) => {
+    const reply = (status, data) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(data)); };
     try {
-      if (req.method === "GET" && pathname === "/api/ping") {
-        sendJson(res, 200, {
-          ok: true,
-          version: BRIDGE_VERSION,
-          pid: process.pid,
-          port: PORT,
-          appHome,
-        });
-        return;
+      const hostCount = req.rawHeaders.filter((v,i) => i % 2 === 0 && v.toLowerCase() === 'host').length;
+      if (hostCount !== 1 || ![`127.0.0.1:${PORT}`, `localhost:${PORT}`].includes(req.headers.host)) throw fail(403, 'Host refused');
+      const origin = req.headers.origin;
+      const extOrigin = `chrome-extension://${EXT_ID}`;
+      if (origin && origin !== extOrigin) throw fail(403, 'Origin refused');
+      const route = new URL(req.url, `http://${HOST}:${PORT}`).pathname;
+      if (req.method === 'OPTIONS') {
+        if (!origin || origin !== extOrigin) throw fail(403, 'Origin refused');
+        res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST'); res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+        res.writeHead(204); res.end(); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/shutdown") {
-        sendJson(res, 200, { ok: true });
-        setTimeout(() => process.exit(0), 50);
-        return;
+      if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); }
+      if (route === '/api/ping' && req.method === 'GET') { reply(200, { ok: true, version: VERSION }); return; }
+      if (route === '/api/pair' && req.method === 'POST') {
+        if (Number(req.headers['content-length'] || 0) > 1024) throw fail(413, 'Pair request too large');
+        const body = await bodyRead(req);
+        if (!pairing || pairing.expires < Date.now() || pairing.attempts >= 5) throw fail(403, 'Generate a new pairing code in Herdr');
+        pairing.attempts++;
+        if (!plain(body) || body.extensionId !== EXT_ID || !equal(body.code, pairing.code)) throw fail(403, 'Invalid pairing code');
+        const token = secret(); auth.clients = [{ token, extensionId: EXT_ID, pairedAt: Date.now() }]; pairing = null;
+        atomic(p.auth, auth); reply(200, { ok: true, token }); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/ext-heartbeat") {
-        const body = await readRequestBody(req);
-        const shouldReload = pendingExtReload;
-        if (pendingExtReload) {
-          pendingExtReload = false;
-        }
-        const extStatus = computeAndSaveExtStatus(appHome, {
-          extId: body.extId || EXPECTED_EXT_ID,
-          version: body.version || "1.0.0",
-          lastSeenAt: Date.now(),
-        });
-        sendJson(res, 200, { ok: true, shouldReload, extension: extStatus });
-        return;
+      const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
+      const admin = equal(token, auth.admin);
+      const client = auth.clients.find(c => equal(token, c.token));
+      if (!admin && !client) throw fail(401, 'Authentication required');
+      if (origin && (admin || client?.extensionId !== EXT_ID)) throw fail(403, 'Origin refused');
+      const key = admin ? 'admin' : client.token;
+      const now = Date.now(), limit = limits.get(key);
+      if (!limit || now - limit.since > 60000) limits.set(key, { since: now, count: 1 });
+      else if (++limit.count > 1200) throw fail(429, 'Rate limit exceeded');
+      if (route.startsWith('/admin/') && !admin) throw fail(403, 'Local administration only');
+      if (route === '/admin/identity' && req.method === 'GET') { reply(200, { ok: true, version: VERSION, home }); return; }
+      if (route === '/admin/status' && req.method === 'GET') {
+        reply(200, { ok: true, installed: auth.clients.length > 0, connected: auth.clients.some(c => now - (c.lastSeen || 0) < 60000), version: VERSION, pairedAt: auth.clients[0]?.pairedAt || null }); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/request-reload") {
-        pendingExtReload = true;
-        sendJson(res, 200, { ok: true });
-        return;
+      if (route === '/admin/pair' && req.method === 'POST') {
+        pairing = { code: randomBytes(8).toString('hex').toUpperCase(), expires: now + 300000, attempts: 0 };
+        reply(200, { ok: true, code: pairing.code, expiresAt: pairing.expires }); return;
       }
-
-      if (req.method === "GET" && pathname === "/api/ext-status") {
-        const extStatus = computeAndSaveExtStatus(appHome);
-        sendJson(res, 200, { ok: true, extension: extStatus });
-        return;
+      if (route === '/admin/cancel-pair' && req.method === 'POST') {
+        const body = await bodyRead(req);
+        if (plain(body) && pairing && equal(body.code, pairing.code)) pairing = null;
+        reply(200, { ok: true }); return;
       }
-
-      if (
-        req.method === "POST" &&
-        (pathname === "/api/install-extension" ||
-          pathname === "/api/update-extension")
-      ) {
-        pendingExtReload = true;
-        const result = await installChromeExtension(appHome);
-        sendJson(res, 200, result);
-        return;
+      if (route === '/admin/revoke' && req.method === 'POST') {
+        auth.clients = []; pairing = null; atomic(p.auth, auth); limits.clear(); reply(200, { ok: true }); return;
       }
-
-      if (req.method === "GET" && pathname === "/api/status") {
-        const ctx = readJsonSafe(paths.contextFile, null);
-        const queue = readJsonSafe(paths.queueFile, { batches: [] });
-        const extStatus = computeAndSaveExtStatus(appHome);
-        let agents = Array.isArray(ctx?.agents) ? ctx.agents : [];
-        if (!agents.length) {
-          const rawTerms = await queryHcTerminals();
-          agents = rawTerms
-            .filter(t => t && (t.report?.app || t.state === "running"))
-            .map(t => {
-              const agentName = t.report?.app || t.name || t.address || "Agent";
-              const spaceName = t.labels?.space || "space";
-              let rawSession = t.labels?.["herdr.session"] || "";
-              if (!rawSession && t.title && String(t.title).startsWith("π - ")) {
-                const parts = String(t.title).slice(4).split(" - ");
-                if (parts.length >= 2) rawSession = parts.slice(0, -1).join(" - ").trim();
-              }
-              if (!rawSession) rawSession = t.name || t.address || "";
-              const shortSession =
-                rawSession.length > 16 ? `${rawSession.slice(0, 16)}...` : rawSession;
-              return {
-                address: t.address || t.id,
-                pane: null,
-                space: "",
-                spaceName,
-                tabName: t.name || "",
-                status: t.status || "idle",
-                app:
-                  t.report?.app ||
-                  (Array.isArray(t.argv) ? t.argv[0] : "terminal"),
-                programName: agentName,
-                title: t.title || t.name || t.address,
-                sessionName: rawSession,
-                displayLabel: `${agentName} · ${spaceName} (${shortSession})`,
-                focused: false,
-              };
-            });
-        }
-        sendJson(res, 200, {
-          ok: true,
-          version: BRIDGE_VERSION,
-          port: PORT,
-          appHome,
-          cwd: ctx?.cwd || "",
-          activeSpace: ctx?.activeSpace || null,
-          focused: ctx?.focused || null,
-          agents,
-          queueCount: (queue.batches || []).length,
-          extension: extStatus,
-        });
-        return;
+      if (route === '/admin/rotate' && req.method === 'POST') {
+        auth = { admin: secret(), clients: [] }; pairing = null; atomic(p.auth, auth); limits.clear(); reply(200, { ok: true }); return;
       }
-
-      if (req.method === "GET" && pathname === "/api/annotations") {
-        const queue = readJsonSafe(paths.queueFile, { batches: [] });
-        sendJson(res, 200, { ok: true, batches: queue.batches || [] });
-        return;
+      if (route === '/admin/shutdown' && req.method === 'POST') {
+        reply(200, { ok: true }); setTimeout(() => srv.close(() => process.exit(0)), 50).unref(); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/annotations") {
-        const body = await readRequestBody(req);
-        const now = Date.now();
-        const queue = readJsonSafe(paths.queueFile, { batches: [] });
-        const existing = Array.isArray(queue.batches) ? queue.batches : [];
-        const targetTerminal = body.targetTerminal || "default";
-
-        // Match existing batch by (url, targetTerminal) when replaceSameUrl !== false
-        const sameUrlBatch =
-          body.replaceSameUrl !== false && body.url
-            ? existing.find(
-                b =>
-                  b.url === body.url &&
-                  (b.targetTerminal || "default") === targetTerminal,
-              )
-            : null;
-        const batchId =
-          body.id ||
-          sameUrlBatch?.id ||
-          `b-${now}-${Math.random().toString(36).slice(2, 7)}`;
-
-        const rawItems = Array.isArray(body.items) ? body.items : [];
-        const globalNote = String(body.globalNote || "").trim();
-
-        // If all items were deleted on this page, remove the batch for (url, targetTerminal)
-        if (rawItems.length === 0 && !globalNote && body.action === "silent_stage") {
-          const filtered = existing.filter(b => b.id !== batchId);
-          writeJsonAtomic(paths.queueFile, { batches: filtered });
-          sendJson(res, 200, { ok: true, removed: true });
-          return;
-        }
-
-        computeAndSaveExtStatus(appHome, {
-          extId: EXPECTED_EXT_ID,
-          version: getBundledExtensionVersion(appHome),
-          lastSeenAt: now,
-        });
-
-        let screenshotRelPath = sameUrlBatch?.screenshotRelPath || null;
-        let screenshotAbsPath = sameUrlBatch?.screenshotAbsPath || null;
-
-        if (
-          typeof body.screenshotDataUrl === "string" &&
-          body.screenshotDataUrl.startsWith("data:image/")
-        ) {
-          const commaIdx = body.screenshotDataUrl.indexOf(",");
-          if (commaIdx > 0) {
-            const base64 = body.screenshotDataUrl.slice(commaIdx + 1);
-            const fileName = `annot-${batchId}-${now}.png`;
-            screenshotAbsPath = path.join(paths.shotsDir, fileName);
-            screenshotRelPath = `data/annotations/shots/${fileName}`;
-            fs.writeFileSync(screenshotAbsPath, Buffer.from(base64, "base64"));
-          }
-        }
-
-        const items = rawItems.map((it, idx) => ({
-          id: it.id || `item-${idx + 1}`,
-          index: idx + 1,
-          enabled: it.enabled !== false,
-          kind: it.kind || "element",
-          note: String(it.note || "").trim(),
-          tagName: it.tagName || "",
-          selector: it.selector || "",
-          text: it.text || "",
-          selectedText: it.selectedText || "",
-          htmlSnippet: it.htmlSnippet || "",
-          rect: it.rect || null,
-          styles: it.styles || {},
-          source: it.source || null,
-          groupedElements: Array.isArray(it.groupedElements)
-            ? it.groupedElements
-            : [],
+      if (route === '/admin/context' && req.method === 'POST') {
+        const body = await bodyRead(req); if (!plain(body) || Buffer.byteLength(JSON.stringify(body)) > 65536) throw fail(400, 'Invalid context');
+        atomic(p.context, body); reply(200, { ok: true }); return;
+      }
+      if (route === '/api/ext-heartbeat' && req.method === 'POST') {
+        if (client) client.lastSeen = now;
+        reply(200, { ok: true }); return;
+      }
+      if (route === '/api/status' && req.method === 'GET') {
+        const ctx = readJSON(p.context, {});
+        const agents = (Array.isArray(ctx.agents) ? ctx.agents : []).filter(a => !String(a.address).includes('/')).map(a => ({
+          address: a.address, space: a.space, spaceName: a.spaceName, sessionName: a.sessionName, programName: a.programName, displayLabel: a.displayLabel, focused: a.focused,
         }));
-
-        const action = body.action || "paste";
-        const batch = {
-          id: batchId,
-          createdAt: now,
-          url: body.url || "",
-          title: body.title || "",
-          viewport: body.viewport || null,
-          globalNote,
-          action,
-          targetTerminal,
-          targetPane: body.targetPane || null,
-          screenshotRelPath,
-          screenshotAbsPath,
-          items,
-        };
-
-        const updated = [batch, ...existing.filter(b => b.id !== batchId)];
-
-        while (updated.length > MAX_BATCHES) {
-          const removed = updated.pop();
-          if (
-            removed?.screenshotAbsPath &&
-            fs.existsSync(removed.screenshotAbsPath)
-          ) {
-            try {
-              fs.unlinkSync(removed.screenshotAbsPath);
-            } catch {}
-          }
-        }
-
-        writeJsonAtomic(paths.queueFile, { batches: updated });
-
-        const cmd =
-          action === "silent_stage"
-            ? null
-            : {
-                id: `cmd-${now}-${Math.random().toString(36).slice(2, 6)}`,
-                batchId,
-                action,
-                targetTerminal: batch.targetTerminal,
-                targetPane: batch.targetPane,
-                createdAt: now,
-              };
-        if (cmd) {
-          writeJsonAtomic(paths.commandFile, cmd);
-        }
-
-        sendJson(res, 200, {
-          ok: true,
-          batch,
-          command: cmd,
-        });
-        return;
+        reply(200, { ok: true, version: VERSION, cwd: ctx.cwd || '', activeSpace: ctx.activeSpace ? { id: ctx.activeSpace.id, name: ctx.activeSpace.name } : null, focused: { terminal: ctx.focused?.terminal || null }, agents }); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/annotations/delete") {
-        const body = await readRequestBody(req);
-        const queue = readJsonSafe(paths.queueFile, { batches: [] });
-        const batches = Array.isArray(queue.batches) ? queue.batches : [];
-        if (body.batchId && body.itemId) {
-          const target = batches.find(b => b.id === body.batchId);
-          if (target && Array.isArray(target.items)) {
-            target.items = target.items
-              .filter(it => it.id !== body.itemId)
-              .map((it, idx) => ({ ...it, index: idx + 1 }));
-          }
-          writeJsonAtomic(paths.queueFile, { batches });
-        } else if (body.batchId) {
-          const removed = batches.find(b => b.id === body.batchId);
-          if (
-            removed?.screenshotAbsPath &&
-            fs.existsSync(removed.screenshotAbsPath)
-          ) {
-            try {
-              fs.unlinkSync(removed.screenshotAbsPath);
-            } catch {}
-          }
-          writeJsonAtomic(paths.queueFile, {
-            batches: batches.filter(b => b.id !== body.batchId),
+      if ((route === '/api/annotations' || route === '/admin/queue') && req.method === 'GET') {
+        if (route === '/admin/queue' || admin) { reply(200, { ok: true, ...queueRead(p) }); return; }
+        throw fail(403, 'Local review only');
+      }
+      if (route === '/admin/queue' && req.method === 'POST') {
+        const body = await bodyRead(req);
+        await serial(() => {
+          const old = queueRead(p);
+          if (body.revision !== old.revision) throw fail(409, 'Queue changed; reload before editing');
+          if (!Array.isArray(body.batches) || body.batches.length > old.batches.length) throw fail(400, 'Invalid queue edit');
+          const next = body.batches.map(edit => {
+            const original = old.batches.find(b => b.id === edit.id);
+            if (!original) throw fail(409, 'Batch no longer exists');
+            if (!Array.isArray(edit.items)) throw fail(400, 'Invalid queue edit');
+            const items = edit.items.map(it => {
+              const item = original.items.find(x => x.id === it.id);
+              if (!item) throw fail(409, 'Item no longer exists');
+              return { ...item, enabled: it.enabled !== false, note: string(it.note, 4096) };
+            });
+            return { ...original, globalNote: string(edit.globalNote, 16384), items };
           });
-        }
-        sendJson(res, 200, { ok: true });
-        return;
+          const q = { revision: old.revision + 1, batches: next }; cleanup(p, q); atomic(p.queue, q);
+          reply(200, { ok: true, ...q });
+        }); return;
       }
-
-      if (req.method === "POST" && pathname === "/api/annotations/clear") {
-        let body = {};
-        try {
-          body = await readRequestBody(req);
-        } catch {}
-        const queue = readJsonSafe(paths.queueFile, { batches: [] });
-        const batches = Array.isArray(queue.batches) ? queue.batches : [];
-        if (body.targetTerminal) {
-          const remaining = batches.filter(
-            b => (b.targetTerminal || "default") !== body.targetTerminal,
-          );
-          writeJsonAtomic(paths.queueFile, { batches: remaining });
-        } else {
-          writeJsonAtomic(paths.queueFile, { batches: [] });
-        }
-        sendJson(res, 200, { ok: true });
-        return;
+      if (route === '/api/annotations' && req.method === 'POST') {
+        if (!client) throw fail(403, 'Browser client required');
+        const a = annotation(await bodyRead(req));
+        await serial(() => {
+          const q = queueRead(p);
+          if (q.batches.some(b => b.requestId === a.requestId && b.clientId === client.extensionId)) { reply(200, { ok: true, staged: true }); return; }
+          const bytes = cleanup(p, q);
+          if (a.screenshot && bytes + a.screenshot.length > SHOT_QUOTA) throw fail(413, 'Screenshot quota exceeded');
+          const same = q.batches.find(b => b.url === a.url && b.targetTerminal === a.targetTerminal && b.clientId === client.extensionId);
+          const shot = a.screenshot ? `shot-${randomUUID()}.png` : same?.shot;
+          if (a.screenshot) { const file = path.join(p.shots, shot); noLink(file); fs.writeFileSync(file, a.screenshot, { flag: 'wx', mode: 0o600 }); }
+          const { screenshot, ...meta } = a;
+          const batch = { ...meta, id: randomUUID(), createdAt: now, action: 'stage', untrusted: true, clientId: client.extensionId, ...(shot ? { shot, screenshotAbsPath: path.join(p.shots, shot), screenshotRelPath: `data/annotations/shots/${shot}` } : {}) };
+          q.batches = q.batches.filter(b => b !== same);
+          if (a.items.length || a.globalNote) q.batches.unshift(batch);
+          q.revision++; cleanup(p, q); atomic(p.queue, q);
+          reply(200, { ok: true, staged: true });
+        }); return;
       }
-
-      sendJson(res, 404, { ok: false, error: "Not found" });
-    } catch (err) {
-      sendJson(res, 500, { ok: false, error: String(err?.message || err) });
-    }
+      throw fail(404, 'Not found');
+    } catch (e) { if (!res.headersSent && !res.destroyed) reply(e.status || 500, { ok: false, error: e.status ? e.message : 'Bridge operation failed' }); }
   });
-
-  server.on("error", err => {
-    if (err && err.code === "EADDRINUSE") {
-      process.exit(0);
-    }
-    process.exit(1);
-  });
-
-  server.listen(PORT, HOST, () => {
-    writeJsonAtomic(paths.bridgeFile, {
-      version: BRIDGE_VERSION,
-      pid: process.pid,
-      port: PORT,
-      startedAt: Date.now(),
-    });
+  srv.requestTimeout = 10000; srv.headersTimeout = 5000;
+  srv.on('error', () => { console.error('Bridge port unavailable'); process.exit(1); });
+  srv.listen(PORT, HOST, () => {
+    atomic(path.join(p.base, 'bridge.json'), { version: VERSION, pid: process.pid, port: PORT });
   });
 }
-
-const args = parseArgs(process.argv);
-if (args.mode === "daemon") {
-  runDaemonBootstrap(args.appHome);
-} else if (args.mode === "check-ext") {
-  const res = computeAndSaveExtStatus(args.appHome);
-  process.stdout.write(JSON.stringify(res) + "\n");
-  process.exit(0);
-} else if (args.mode === "install-ext" || args.mode === "update-ext") {
-  httpPostJson(`http://${HOST}:${PORT}/api/request-reload`, {}, 300).then(() =>
-    installChromeExtension(args.appHome).then(res => {
-      process.stdout.write(JSON.stringify(res) + "\n");
-      process.exit(res.ok ? 0 : 1);
-    }),
-  );
-} else {
-  startServer(args.appHome);
+async function localRequest(home, route, body) {
+  const p = dirs(home); const auth = credentials(p);
+  const res = await fetch(`http://${HOST}:${PORT}${route}`, {
+    method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${auth.admin}`, 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(5000),
+  });
+  const result = await res.json(); if (!res.ok) throw new Error(result.error || 'Bridge refused operation'); return result;
 }
+async function main() {
+  const argv = process.argv.slice(2);
+  const homeAt = argv.indexOf('--app-home');
+  const requestedHome = path.resolve(homeAt >= 0 ? argv[homeAt + 1] : process.env.HERDR_APP_HOME || path.join(os.homedir(), '.config/herdr-app'));
+  // macOS /var and /tmp are system symlinks. Resolve the authorized home once;
+  // reject symlinks beneath that canonical storage root.
+  const home = fs.realpathSync(requestedHome);
+  const mode = argv.find(a => a.startsWith('--') && a !== '--app-home') || '--serve';
+  if (mode === '--serve') { server(home); return; }
+  if (mode === '--install-ext' || mode === '--update-ext') {
+    console.log(JSON.stringify(await installChromeExtension(home))); return;
+  }
+  if (mode === '--daemon') {
+    // Public health is not identity. Never reuse an unauthenticated/foreign listener.
+    let occupied = false;
+    try { await fetch(`http://${HOST}:${PORT}/api/ping`, { signal: AbortSignal.timeout(500) }); occupied = true; } catch {}
+    if (occupied) {
+      const identity = await localRequest(home, '/admin/identity');
+      if (identity.home !== home || identity.version !== VERSION) throw new Error('Foreign or outdated bridge; stop it locally first');
+      console.log(JSON.stringify({ ok: true })); return;
+    }
+    dirs(home);
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--serve', '--app-home', home], { detached: true, stdio: 'ignore', env: process.env });
+    child.unref();
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      try { const id = await localRequest(home, '/admin/identity'); if (id.home === home && id.version === VERSION) { console.log(JSON.stringify({ ok: true })); return; } } catch {}
+    }
+    throw new Error('Bridge failed to start');
+  }
+  const routes = { '--check-ext': '/admin/status', '--pair': '/admin/pair', '--cancel-pair': '/admin/cancel-pair', '--revoke': '/admin/revoke', '--rotate': '/admin/rotate', '--shutdown': '/admin/shutdown', '--queue': '/admin/queue', '--write-queue': '/admin/queue', '--context': '/admin/context' };
+  if (!routes[mode]) throw new Error('Unsupported bridge command');
+  let body;
+  if (['--pair', '--revoke', '--rotate', '--shutdown'].includes(mode)) body = {};
+  if (['--write-queue', '--context', '--cancel-pair'].includes(mode)) {
+    const at = argv.indexOf('--json'); if (at < 0) throw new Error('--json is required'); body = JSON.parse(argv[at + 1]);
+  }
+  console.log(JSON.stringify(await localRequest(home, routes[mode], body)));
+}
+main().catch(() => { console.error('Bridge operation failed; ensure the secure bridge is running and its port is free'); process.exitCode = 1; });
