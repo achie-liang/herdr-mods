@@ -344,16 +344,17 @@ export function applyPreserveCase(matched, replacement) {
   return replacement;
 }
 
-export function formatRef(path, dir, startLine, endLine) {
-  const clean = dir && !path.endsWith("/") ? `${path}/` : path;
-  const quoted = /\s/.test(clean) ? `"${clean}"` : clean;
-  if (!dir && startLine != null) {
-    const a = Math.min(startLine, endLine ?? startLine);
-    const b = Math.max(startLine, endLine ?? startLine);
-    return a === b ? `@${quoted}#L${a}` : `@${quoted}#L${a}-L${b}`;
-  }
-  return `@${quoted}`;
-}
+export {
+  normalizePosixPath,
+  resolveRefPath,
+  formatRef,
+  offsetToLineCol,
+  normalizeSelectionBounds,
+  isWholeLineSelection,
+  formatSelectionRef,
+  formatSelectionBadge,
+  rangeToLineColSelection,
+} from "./selection.js";
 
 export function pasteIntoTerminal(text, cx, target) {
   const f = target || focused();
