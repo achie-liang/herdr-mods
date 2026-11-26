@@ -486,7 +486,7 @@ export const searchMethods = {
 
       if (!folded) {
         g.matches.forEach((m, mIdx) => {
-          const matchRef = formatRef(g.path, false, m.line, m.line);
+          const matchRef = formatRef(this.refPath(g.path), false, m.line, m.line);
           const isCurrentOpenMatch = this.file === g.path && this.selStart === m.line;
           resultRows.push(
             h_flex()

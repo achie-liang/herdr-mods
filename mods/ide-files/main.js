@@ -24,6 +24,8 @@ import {
   location,
   locationKey,
   matchAgentWorktreeFeature,
+  normalizePosixPath,
+  resolveRefPath,
   formatRef,
   pasteIntoTerminal,
 } from "./utils.js";
@@ -105,6 +107,8 @@ export default class IdeFiles extends View {
       cx.notify();
     });
     this.baseRoot = null;
+    this.agentCwd = null;
+    this.gitRootCache = new Map();
     this.hasWorktreeDir = false;
     this.wtDirs = [];
     this.wtFeatures = [];
@@ -126,6 +130,8 @@ export default class IdeFiles extends View {
     this.lines = [];
     this.rawText = "";
     this.mdPreview = true;
+    this.mdSelection = null;
+    this.lastMdSelection = null;
     this.lineScroll = 0;
     this.linesViewHeight = 520;
     this.scrollbarDrag = false;
@@ -651,19 +657,43 @@ export default class IdeFiles extends View {
     return false;
   }
 
+  refPath(path) {
+    return resolveRefPath(path, this.root, this.agentCwd);
+  }
+
+  expandRelativeSubdir(rootDir, targetDir) {
+    const root = normalizePosixPath(rootDir);
+    const target = normalizePosixPath(targetDir);
+    if (!root || !target || !target.startsWith(`${root}/`)) return;
+    const rel = target.slice(root.length + 1);
+    if (!rel) return;
+    const parts = rel.split("/").filter(Boolean);
+    let cur = "";
+    for (const part of parts) {
+      cur = cur ? `${cur}/${part}` : part;
+      this.folders.add(cur);
+    }
+  }
+
   refresh(cx) {
     this.rememberTarget();
     const { cwd: rawCwd, on, agentKey, agentCandidates } = location();
-    let baseRoot = rawCwd;
+    let rawBaseRoot = rawCwd;
     let detectedFeature = null;
+    let isWorktreeSubdir = false;
     if (rawCwd) {
       const wtMatch = /^(.*)\/(\.worktrees?|worktrees?)\/([^/]+)(?:\/.*)?$/.exec(rawCwd);
       if (wtMatch && wtMatch[1]) {
-        baseRoot = wtMatch[1];
+        rawBaseRoot = wtMatch[1];
         detectedFeature = `${wtMatch[2]}/${wtMatch[3]}`;
+        isWorktreeSubdir = true;
       }
     }
-    const next = JSON.stringify({ baseRoot, on, agentKey });
+    const gitCacheKey = `${on || "local"}:${rawCwd || ""}`;
+    const cachedGitRoot = !isWorktreeSubdir && rawCwd ? this.gitRootCache.get(gitCacheKey) : null;
+    let baseRoot = cachedGitRoot || rawBaseRoot;
+    const next = JSON.stringify({ baseRoot: rawBaseRoot, on, agentKey });
+    this.agentCwd = rawCwd || null;
     if (next !== this.context?.key) {
       const sameWorkspace =
         this.context && this.context.baseRoot === baseRoot && this.context.on === on;
@@ -713,6 +743,8 @@ export default class IdeFiles extends View {
         key: next,
         cwd: activeRoot,
         baseRoot,
+        rawBaseRoot,
+        agentCwd: rawCwd || null,
         on,
         agentKey,
         agentCandidates,
@@ -743,15 +775,40 @@ export default class IdeFiles extends View {
       if (saved?.file) this.show(saved.file, cx, { fromHistory: true });
       if (this.searchMode && this.wsQuery) this.executeWorkspaceSearch(cx);
     }
-    if (!baseRoot || this.loading) return;
+    if (!rawBaseRoot || this.loading) return;
     const context = this.context;
     this.loading = true;
     this.limited = false;
     cx.spawn(async cx => {
       try {
+        let resolvedBaseRoot = this.baseRoot || baseRoot;
+        if (!isWorktreeSubdir && rawCwd) {
+          const topRes = await exec("git", ["rev-parse", "--show-toplevel"], {
+            cwd: rawCwd,
+            on,
+          }).catch(() => null);
+          if (!this.current(context)) return;
+          const gitTop = topRes?.code === 0 ? normalizePosixPath(topRes.stdout.trim()) : "";
+          const normRaw = normalizePosixPath(rawCwd);
+          if (gitTop && (normRaw === gitTop || normRaw.startsWith(`${gitTop}/`))) {
+            this.gitRootCache.set(gitCacheKey, gitTop);
+            resolvedBaseRoot = gitTop;
+          } else {
+            this.gitRootCache.set(gitCacheKey, rawBaseRoot);
+            resolvedBaseRoot = rawBaseRoot;
+          }
+        }
+        if (resolvedBaseRoot !== this.baseRoot) {
+          this.baseRoot = resolvedBaseRoot;
+          context.baseRoot = resolvedBaseRoot;
+          this.entries = new Map();
+          this.wsIndex = [];
+          this.wsIndexRoot = null;
+        }
+
         const customWtDirs = shared("ide.worktree_dirs");
         const wtInfo = await discoverWorktreeFeatures(
-          baseRoot,
+          resolvedBaseRoot,
           Array.isArray(customWtDirs)
             ? customWtDirs
             : typeof customWtDirs === "string"
@@ -806,6 +863,10 @@ export default class IdeFiles extends View {
         this.root = effectiveRoot;
         context.cwd = effectiveRoot;
 
+        if (this.folders.size === 0 && rawCwd) {
+          this.expandRelativeSubdir(effectiveRoot, rawCwd);
+        }
+
         this.repos = new Set();
         for (const path of ["", ...this.folders]) {
           if (!this.current(context)) return;
@@ -827,7 +888,7 @@ export default class IdeFiles extends View {
         this.branches = {};
         this.applyRepoResults(results);
         this.error = null;
-        this.watch(baseRoot, cx);
+        this.watch(effectiveRoot, cx);
       } catch (e) {
         if (this.current(context)) this.error = String(e);
       } finally {
@@ -895,7 +956,7 @@ export default class IdeFiles extends View {
   }
 
   buildEntryMenuItems(path, dir, lineNo = null) {
-    const ref = formatRef(path, dir, lineNo, lineNo);
+    const ref = formatRef(this.refPath(path), dir, lineNo, lineNo);
     const full = this.root ? `${this.root}/${path}` : path;
     return [
       { label: `Add to Chat (${ref})`, action: "chat", value: ref },
@@ -916,7 +977,7 @@ export default class IdeFiles extends View {
       const folderMark = entry.dir ? this.folderMarks[absPath] : null;
       const ignored = !fileMark && !folderMark && this.isIgnored(absPath);
       const branch = entry.dir ? this.branches[absPath] : null;
-      const ref = formatRef(path, entry.dir);
+      const ref = formatRef(this.refPath(path), entry.dir);
       const isDragged = this.drag?.path === path && this.drag?.moved;
       const isActiveFile = !entry.dir && this.file === path;
       const isDirtyEntry =
@@ -1539,9 +1600,7 @@ export default class IdeFiles extends View {
     this.rememberTarget();
     const t = theme();
     const range = this.selectedRange();
-    const activeRef = this.file
-      ? formatRef(this.file, false, range ? range[0] : null, range ? range[1] : null)
-      : null;
+    const activeRef = this.getActiveSelectionRef();
 
     return v_flex()
       .id("files")
@@ -1567,7 +1626,7 @@ export default class IdeFiles extends View {
           this.saveCurrentFile(cx);
           return;
         }
-        if (cmdOrCtrl && k === "c" && this.file && !this.rawEditor) {
+        if (cmdOrCtrl && k === "c" && this.file && !this.rawEditor && !this.isMarkdownPreviewActive()) {
           const selText = this.getSelectedText?.();
           if (selText) {
             cx.stop_propagation();
@@ -1649,6 +1708,12 @@ export default class IdeFiles extends View {
           if (this.file && this.diffView) {
             cx.stop_propagation();
             this.diffView = false;
+            cx.notify();
+            return;
+          }
+          if (this.file && this.mdSelection) {
+            cx.stop_propagation();
+            this.mdSelection = null;
             cx.notify();
             return;
           }

@@ -9,6 +9,9 @@ import {
   isMarkdownFile,
   buildSearchRegExp,
   formatRef,
+  formatSelectionRef,
+  formatSelectionBadge,
+  rangeToLineColSelection,
   pasteIntoTerminal,
 } from "./utils.js";
 
@@ -969,6 +972,8 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     this.selEnd = null;
     this.selAnchor = null;
     this.selFocus = null;
+    this.mdSelection = null;
+    this.lastMdSelection = null;
     this.selectingLines = false;
     this.drag = null;
     this.contextMenu = null;
@@ -1213,21 +1218,125 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     return [s, e];
   },
 
+  isMarkdownPreviewActive() {
+    return Boolean(
+      this.file &&
+        isMarkdownFile(this.file) &&
+        this.mdPreview &&
+        !this.findOpen &&
+        !this.diffView,
+    );
+  },
+
+  handleMarkdownSelectionChange(selection, cx) {
+    if (!selection || !selection.text?.trim()) {
+      this.mdSelection = null;
+      cx.notify();
+      return;
+    }
+    const mapped = rangeToLineColSelection(
+      this.rawText || "",
+      selection.range,
+      selection.text,
+      this.lines,
+    );
+    const next = {
+      text: selection.text,
+      rawSlice: mapped?.range
+        ? (this.rawText || "").slice(mapped.range.start, mapped.range.end)
+        : selection.text,
+      range: mapped?.range || null,
+      start: mapped?.start || null,
+      end: mapped?.end || null,
+      position: selection.position || null,
+      ts: Date.now(),
+    };
+    this.mdSelection = next;
+    this.lastMdSelection = next;
+    if (mapped) {
+      this.selAnchor = { ...mapped.start };
+      this.selFocus = { ...mapped.end };
+      this.syncLineSelectionFromChar();
+    }
+    cx.notify();
+  },
+
+  activeMarkdownSelection(allowRecent = false) {
+    if (this.mdSelection?.text?.trim()) return this.mdSelection;
+    if (
+      allowRecent &&
+      this.lastMdSelection?.text?.trim() &&
+      Date.now() - (this.lastMdSelection.ts || 0) < 2500
+    ) {
+      return this.lastMdSelection;
+    }
+    return null;
+  },
+
+  getActiveSelectionRef() {
+    if (!this.file) return null;
+    const refFile = this.refPath(this.file);
+    if (this.isMarkdownPreviewActive()) {
+      const mdSel = this.activeMarkdownSelection(false);
+      if (mdSel?.start && mdSel?.end) {
+        return formatSelectionRef(refFile, mdSel, this.lines);
+      }
+      return formatRef(refFile, false);
+    }
+    const norm = this.normalizedCharSelection();
+    if (norm && !norm.empty) {
+      return formatSelectionRef(refFile, norm, this.lines);
+    }
+    const range = this.selectedRange();
+    return formatRef(refFile, false, range ? range[0] : null, range ? range[1] : null);
+  },
+
+  buildMarkdownPreviewMenuItems() {
+    const refFile = this.refPath(this.file);
+    const fileRef = formatRef(refFile, false);
+    const mdSel = this.activeMarkdownSelection(true);
+    const items = [{ label: "Find in File (⌘F)", action: "find", value: "" }];
+    if (mdSel?.start && mdSel?.end) {
+      const selRef = formatSelectionRef(refFile, mdSel, this.lines);
+      items.push(
+        { label: `Add to Chat (${selRef})`, action: "chat", value: selRef, divider: true },
+        { label: `Add Whole File (${fileRef})`, action: "chat", value: fileRef },
+        { label: `Copy ${selRef}`, action: "copy", value: selRef, divider: true },
+        { label: "Copy Selected Text", action: "copy", value: mdSel.text },
+      );
+      if (mdSel.rawSlice && mdSel.rawSlice !== mdSel.text) {
+        items.push({ label: "Copy Selected Markdown", action: "copy", value: mdSel.rawSlice });
+      }
+      return items;
+    }
+    items.push(
+      { label: `Add Whole File (${fileRef})`, action: "chat", value: fileRef, divider: true },
+      { label: `Copy ${fileRef}`, action: "copy", value: fileRef, divider: true },
+    );
+    if (mdSel?.text) {
+      items.push({ label: "Copy Selected Text", action: "copy", value: mdSel.text });
+    }
+    return items;
+  },
+
   buildLineMenuItems(lineNo) {
     const norm = this.normalizedCharSelection();
     const hasCharSel = Boolean(norm && !norm.empty);
-    const [a, b] =
-      hasCharSel && lineNo >= norm.start.lineNo && lineNo <= norm.end.lineNo
-        ? [norm.start.lineNo, norm.end.lineNo]
-        : [lineNo, lineNo];
-    if (!hasCharSel || lineNo < norm.start.lineNo || lineNo > norm.end.lineNo) {
+    const insideCharSel =
+      hasCharSel && lineNo >= norm.start.lineNo && lineNo <= norm.end.lineNo;
+    if (!insideCharSel) {
       const len = (this.lines[lineNo - 1] || "").length;
       this.selAnchor = { lineNo, col: 0 };
       this.selFocus = { lineNo, col: len };
       this.syncLineSelectionFromChar();
     }
-    const lineRef = formatRef(this.file, false, a, b);
-    const fileRef = formatRef(this.file, false);
+    const refFile = this.refPath(this.file);
+    const activeNorm = this.normalizedCharSelection();
+    const lineRef =
+      activeNorm && !activeNorm.empty
+        ? formatSelectionRef(refFile, activeNorm, this.lines)
+        : formatRef(refFile, false, lineNo, lineNo);
+    const fileRef = formatRef(refFile, false);
     const snippet = this.getSelectedText() || (this.lines[lineNo - 1] ?? "");
     return [
       { label: "Find in File (⌘F)", action: "find", value: "" },
@@ -2161,7 +2270,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
     const absPath = `${this.root}/${item.path}`;
     const fileMark = !item.isDir ? this.marks[absPath] : null;
     const icon = !item.isDir ? getFileIcon(item.name) : null;
-    const ref = formatRef(item.path, item.isDir);
+    const ref = formatRef(this.refPath(item.path), item.isDir);
 
     return h_flex()
       .id(`quick-item-${idx}-${item.path}`)
@@ -2812,6 +2921,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                       this.mdPreview = true;
                       this.rawEditor = false;
                       this.findOpen = false;
+                      this.mdSelection = null;
                       cx.notify();
                     })
                     .child("Preview"),
@@ -2834,6 +2944,7 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                     .text_size(11.5)
                     .on_click((_e, cx) => {
                       this.mdPreview = false;
+                      this.mdSelection = null;
                       cx.notify();
                     })
                     .child("Source"),
@@ -2924,6 +3035,22 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       return this.renderQuickOpenHome(t, cx);
     }
     const isMd = isMarkdownFile(this.file);
+    const mdSel = isMd && this.mdPreview ? this.activeMarkdownSelection(false) : null;
+    const mdBadge =
+      mdSel?.start && mdSel?.end ? formatSelectionBadge(mdSel, this.lines) : "";
+    const showMdActionBar = Boolean(
+      this.lines.length &&
+        isMd &&
+        this.mdPreview &&
+        !this.findOpen &&
+        !this.diffView &&
+        mdSel?.start &&
+        mdSel?.end,
+    );
+    const mdSelRef = showMdActionBar
+      ? formatSelectionRef(this.refPath(this.file), mdSel, this.lines)
+      : null;
+
     return v_flex()
       .id("files-preview-pane")
       .flex_1()
@@ -2931,6 +3058,76 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
       .h_full()
       .min_h(0)
       .when(this.findOpen, sub => sub.child(this.renderFileFindBar(t)))
+      .when(showMdActionBar, sub =>
+        sub.child(
+          h_flex()
+            .id("files-md-selection-bar")
+            .h(32)
+            .flex_none()
+            .px(12)
+            .gap(8)
+            .items_center()
+            .bg(t.popover)
+            .border_b(1)
+            .border_color(t.border)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(11.5)
+                .text_color(t.muted)
+                .child(`Selected ${mdBadge || mdSelRef}`),
+            )
+            .child(
+              h_flex()
+                .id("files-md-add-chat-btn")
+                .h(22)
+                .px(8)
+                .gap(4)
+                .flex_none()
+                .items_center()
+                .rounded(5)
+                .cursor_pointer()
+                .bg(t.selected)
+                .border_1()
+                .border_color(t.accent)
+                .text_size(11.5)
+                .text_color(t.accent)
+                .hover(s => s.opacity(0.9))
+                .tooltip(`Add to Chat (${mdSelRef})`)
+                .on_click((_e, cx) => {
+                  const target = this.rememberTarget();
+                  pasteIntoTerminal(mdSelRef, cx, target);
+                  cx.notify();
+                })
+                .child(svg("mods/ide-files/plus.svg").size(11.5).flex_none().text_color(t.accent))
+                .child("Add to Chat"),
+            )
+            .child(
+              div()
+                .id("files-md-copy-ref-btn")
+                .h(22)
+                .px(7)
+                .flex()
+                .flex_none()
+                .items_center()
+                .rounded(5)
+                .cursor_pointer()
+                .text_size(11.5)
+                .text_color(t.muted)
+                .hover(s => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(`Copy ${mdSelRef}`)
+                .on_click((_e, cx) => {
+                  cx.write_to_clipboard(mdSelRef);
+                  notify({ title: "Copied", body: mdSelRef, timeout: 1500 });
+                  cx.notify();
+                })
+                .child("Copy Ref"),
+            ),
+        ),
+      )
       .child(
         this.lines.length
           ? isMd && this.mdPreview && !this.findOpen && !this.diffView
@@ -2946,10 +3143,16 @@ find . \\( -name .git -o -name node_modules -o -name .worktree \\) -prune -o -ty
                     this.enterEditMode(1, 0, cx);
                   }
                 })
+                .on_mouse_down("right", () => {
+                  this.pendingMenu = this.buildMarkdownPreviewMenuItems();
+                })
                 .child(
                   TextView.markdown("files-md-view", this.rawText || "")
                     .selectable(true)
                     .scrollable(false)
+                    .on_selection_change((selection, cx) =>
+                      this.handleMarkdownSelectionChange(selection, cx),
+                    )
                     .w_full(),
                 )
             : this.diffView && !this.findOpen
