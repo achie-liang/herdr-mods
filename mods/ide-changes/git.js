@@ -497,3 +497,240 @@ export async function inspectRepoChanges(repoRoot, relName, on) {
     limited: entries.length > 1000,
   };
 }
+
+export function compactRelTime(unixSeconds) {
+  if (!unixSeconds || !Number.isFinite(unixSeconds)) return "";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
+  if (diff < 60) return "now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d`;
+  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo`;
+  return `${Math.floor(diff / (86400 * 365))}y`;
+}
+
+function normalizeGitStatus(raw) {
+  const ch = (raw || "M").trim()[0] || "M";
+  if (ch === "A") return "A";
+  if (ch === "D") return "D";
+  if (ch === "U") return "C";
+  return "M";
+}
+
+function parseNameStatusZ(stdout) {
+  const out = [];
+  const parts = (stdout || "").split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const code = parts[i];
+    if (!code) continue;
+    const status = normalizeGitStatus(code);
+    if (code.startsWith("R") || code.startsWith("C")) {
+      const nextPath = parts[i + 2];
+      i += 2;
+      if (nextPath) out.push({ path: nextPath, status });
+    } else {
+      const path = parts[i + 1];
+      i += 1;
+      if (path) out.push({ path, status });
+    }
+  }
+  return out;
+}
+
+function parseNumstatZ(stdout) {
+  const stats = {};
+  const parts = (stdout || "").split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (!entry) continue;
+    const [a, d, ...rest] = entry.split("\t");
+    if (!rest.length) continue;
+    const path = rest.join("\t");
+    stats[path] = {
+      add: a === "-" ? 0 : Number(a) || 0,
+      del: d === "-" ? 0 : Number(d) || 0,
+      binary: a === "-",
+    };
+  }
+  return stats;
+}
+
+export async function detectDefaultBranch(repoRoot, on) {
+  const git = args => exec("git", [...READ, ...args], { cwd: repoRoot, on }).catch(() => null);
+  const sym = await git(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  if (sym?.code === 0 && sym.stdout.trim()) {
+    const ref = sym.stdout.trim();
+    const label = ref.replace(/^origin\//, "");
+    return { ref, label };
+  }
+  for (const ref of ["origin/main", "origin/master", "main", "master"]) {
+    const r = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+    if (r?.code === 0 && r.stdout.trim()) {
+      return { ref, label: ref.replace(/^origin\//, "") };
+    }
+  }
+  return null;
+}
+
+export async function inspectRepoBranchCommits(repoRoot, relName, branch, hasHead, on) {
+  if (!hasHead) {
+    return { baseRef: null, baseLabel: null, mergeBase: null, commits: [] };
+  }
+  const base = await detectDefaultBranch(repoRoot, on);
+  if (!base) {
+    return { baseRef: null, baseLabel: null, mergeBase: null, commits: [] };
+  }
+  if (branch && branch === base.label) {
+    return { baseRef: base.ref, baseLabel: base.label, mergeBase: null, commits: [] };
+  }
+  const git = args => exec("git", [...READ, ...args], { cwd: repoRoot, on }).catch(() => null);
+  const mbRes = await git(["merge-base", base.ref, "HEAD"]);
+  if (!mbRes || mbRes.code !== 0 || !mbRes.stdout.trim()) {
+    return { baseRef: base.ref, baseLabel: base.label, mergeBase: null, commits: [] };
+  }
+  const mergeBase = mbRes.stdout.trim();
+  const logRes = await git([
+    "log",
+    `${mergeBase}..HEAD`,
+    "--max-count=100",
+    "--format=%x1e%H%x1f%h%x1f%s%x1f%an%x1f%at%x1f%cr",
+    "--shortstat",
+  ]);
+  if (!logRes || logRes.code !== 0 || !logRes.stdout.trim()) {
+    return { baseRef: base.ref, baseLabel: base.label, mergeBase: null, commits: [] };
+  }
+
+  const commits = [];
+  const records = logRes.stdout.split("\x1e").filter(Boolean);
+  for (const rec of records) {
+    const lines = rec.split("\n");
+    const header = lines[0] || "";
+    const [hash, shortHash, subject, author, tsRaw, relTime] = header.split("\x1f");
+    if (!hash) continue;
+    let filesChanged = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const m = /(\d+)\s+files?\s+changed/.exec(lines[i]);
+      if (m) {
+        filesChanged = Number(m[1]) || 0;
+        break;
+      }
+    }
+    commits.push({
+      id: relName ? `${relName}::${hash}` : hash,
+      hash,
+      shortHash: shortHash || hash.slice(0, 7),
+      subject: (subject || "").trim(),
+      author: (author || "").trim(),
+      timestamp: Number(tsRaw) || 0,
+      relTime: (relTime || "").trim(),
+      filesChanged,
+      repoRoot,
+      repoRel: relName,
+      baseLabel: base.label,
+    });
+  }
+
+  return {
+    baseRef: base.ref,
+    baseLabel: base.label,
+    mergeBase: commits.length > 0 ? mergeBase : null,
+    commits,
+  };
+}
+
+export async function inspectRepoAllVsBase(
+  repoRoot,
+  relName,
+  mergeBase,
+  workingFiles,
+  hasHead,
+  on,
+) {
+  const git = args => exec("git", [...READ, ...args], { cwd: repoRoot, on });
+  const [nameStatusRes, numstatRes] = await Promise.all([
+    git(["diff", mergeBase, "--name-status", "-z", "--no-renames"]),
+    git(["diff", mergeBase, "--numstat", "-z", "--no-renames"]),
+  ]);
+  if (nameStatusRes.code !== 0) throw new Error(nameStatusRes.stderr);
+  if (numstatRes.code !== 0) throw new Error(numstatRes.stderr);
+
+  const workingMap = new Map((workingFiles || []).map(f => [f.path, f]));
+  const stats = parseNumstatZ(numstatRes.stdout);
+  const parsed = parseNameStatusZ(nameStatusRes.stdout);
+
+  const seen = new Set();
+  const files = [];
+
+  for (const item of parsed.slice(0, 1000)) {
+    seen.add(item.path);
+    const work = workingMap.get(item.path);
+    const stat = stats[item.path] ?? { add: 0, del: 0, binary: false };
+    const id = relName ? `${relName}::${item.path}` : item.path;
+    files.push({
+      id,
+      repoRoot,
+      repoRel: relName,
+      hasHead,
+      path: item.path,
+      status: work?.status === "U" ? "U" : item.status,
+      fresh: false,
+      uncommitted: Boolean(work),
+      diffBase: mergeBase,
+      source: "branch",
+      ...stat,
+    });
+  }
+
+  for (const work of workingFiles || []) {
+    if (seen.has(work.path)) continue;
+    if (files.length >= 1000) break;
+    files.push({
+      ...work,
+      uncommitted: true,
+      diffBase: work.fresh ? mergeBase : "HEAD",
+      source: "branch",
+    });
+  }
+
+  return {
+    files,
+    limited: parsed.length > 1000,
+  };
+}
+
+export async function inspectCommitFiles(repoRoot, relName, commitHash, on) {
+  const git = args => exec("git", [...READ, ...args], { cwd: repoRoot, on });
+  const [nameStatusRes, numstatRes] = await Promise.all([
+    git(["show", "--format=", "--name-status", "-z", "--no-renames", "--root", commitHash]),
+    git(["show", "--format=", "--numstat", "-z", "--no-renames", "--root", commitHash]),
+  ]);
+  if (nameStatusRes.code !== 0) throw new Error(nameStatusRes.stderr);
+  if (numstatRes.code !== 0) throw new Error(numstatRes.stderr);
+
+  const stats = parseNumstatZ(numstatRes.stdout);
+  const parsed = parseNameStatusZ(nameStatusRes.stdout);
+  const files = parsed.slice(0, 1000).map(item => {
+    const stat = stats[item.path] ?? { add: 0, del: 0, binary: false };
+    const id = relName
+      ? `${relName}::${commitHash}::${item.path}`
+      : `${commitHash}::${item.path}`;
+    return {
+      id,
+      repoRoot,
+      repoRel: relName,
+      hasHead: true,
+      path: item.path,
+      status: item.status,
+      fresh: false,
+      uncommitted: false,
+      commitHash,
+      source: "commit",
+      ...stat,
+    };
+  });
+
+  return {
+    files,
+    limited: parsed.length > 1000,
+  };
+}

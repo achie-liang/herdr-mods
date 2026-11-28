@@ -28,6 +28,10 @@ import {
   readSharedWtState,
   writeSharedWtState,
   inspectRepoChanges,
+  compactRelTime,
+  inspectRepoBranchCommits,
+  inspectRepoAllVsBase,
+  inspectCommitFiles,
 } from "./git.js";
 
 const STORAGE_KEY = "ide-changes.saved";
@@ -67,12 +71,16 @@ function buildRepoChangeTree(files, repoPrefix = "") {
           name: seg,
           key: curPath,
           mark: f.status,
+          hasUncommitted: Boolean(f.uncommitted),
           folders: new Map(),
           files: [],
         };
         cur.folders.set(seg, sub);
-      } else if ((STATUS_PRIORITY[f.status] ?? 0) > (STATUS_PRIORITY[sub.mark] ?? 0)) {
-        sub.mark = f.status;
+      } else {
+        if ((STATUS_PRIORITY[f.status] ?? 0) > (STATUS_PRIORITY[sub.mark] ?? 0)) {
+          sub.mark = f.status;
+        }
+        if (f.uncommitted) sub.hasUncommitted = true;
       }
       cur = sub;
     }
@@ -137,6 +145,17 @@ export default class IdeChanges extends View {
     this.singleBranch = null;
     this.activeRepoRoot = null;
     this.activeRepoRel = "";
+    this.commits = [];
+    this.baseLabel = "main";
+    this.selectedCommitId = null;
+    this.uncommittedOnly = false;
+    this.commitsSectionFolded = false;
+    this.workingGroups = [];
+    this.workingFiles = [];
+    this.allBranchGroups = [];
+    this.allBranchFiles = [];
+    this.commitFileCache = new Map();
+    this.commitLoading = false;
     this.history = [];
     this.historyIdx = -1;
     this.rows = [];
@@ -284,6 +303,187 @@ export default class IdeChanges extends View {
     writeSharedWtState(this.context.key, this.selectedFeature, this.userSpecified);
   }
 
+  resetBranchViewState() {
+    this.commits = [];
+    this.baseLabel = "main";
+    this.selectedCommitId = null;
+    this.uncommittedOnly = false;
+    this.workingGroups = [];
+    this.workingFiles = [];
+    this.allBranchGroups = [];
+    this.allBranchFiles = [];
+    this.commitFileCache.clear();
+    this.commitLoading = false;
+  }
+
+  isBranchMergedView() {
+    return this.commits.length > 0 && !this.selectedCommitId && !this.uncommittedOnly;
+  }
+
+  selectedCommit() {
+    if (!this.selectedCommitId) return null;
+    return this.commits.find(c => c.id === this.selectedCommitId) || null;
+  }
+
+  applyActiveView(cx, context, opts = null) {
+    const commit = this.selectedCommit();
+    let nextGroups = [];
+    let nextFiles = [];
+    let nextLimited = false;
+
+    if (commit) {
+      const cached = this.commitFileCache.get(commit.id);
+      if (cached) {
+        nextGroups = cached.group ? [cached.group] : [];
+        nextFiles = cached.files || [];
+        nextLimited = Boolean(cached.limited);
+      }
+    } else if (this.commits.length > 0 && !this.uncommittedOnly) {
+      nextGroups = this.allBranchGroups;
+      nextFiles = this.allBranchFiles;
+      nextLimited = this.allBranchGroups.some(g => g.limited);
+    } else {
+      nextGroups = this.workingGroups;
+      nextFiles = this.workingFiles;
+      nextLimited = this.workingGroups.some(g => g.limited);
+    }
+
+    this.groups = nextGroups;
+    this.files = nextFiles;
+    this.limited = nextLimited;
+
+    const prevOpen = this.open;
+    if (this.open && !nextFiles.some(f => f.id === this.open)) {
+      this.open = null;
+      this.diffScroll = 0;
+      this.setLines([]);
+    }
+    if (!this.open && !this.closed && nextFiles.length) {
+      this.open = nextFiles[0].id;
+      this.diffScroll = 0;
+      if (!this.history.length || opts?.resetHistory) {
+        this.history = [this.open];
+        this.historyIdx = 0;
+      }
+    }
+
+    const openFile = nextFiles.find(f => f.id === this.open) || nextFiles[0] || nextGroups[0];
+    if (openFile && nextFiles.length > 0) {
+      this.activeRepoRoot = openFile.repoRoot;
+      this.activeRepoRel = openFile.repoRel || "";
+    } else if (!this.multiRepo && this.workingGroups[0]) {
+      this.activeRepoRoot = this.workingGroups[0].repoRoot;
+      this.activeRepoRel = "";
+    } else {
+      this.activeRepoRoot = null;
+      this.activeRepoRel = "";
+    }
+
+    if (opts?.spawnLoad && this.open && (this.open !== prevOpen || !this.rows.length || opts?.forceLoad)) {
+      const fileId = this.open;
+      this.note = null;
+      cx.spawn(async cx => {
+        try {
+          await this.load(fileId, context);
+        } catch {
+          if (this.current(context) && this.open === fileId) {
+            this.setLines(["Cannot preview this diff (too large or unreadable)"]);
+          }
+        }
+        cx.notify();
+      });
+    }
+  }
+
+  selectAllVsBase(cx) {
+    if (!this.selectedCommitId && !this.uncommittedOnly) {
+      cx.notify();
+      return;
+    }
+    this.selectedCommitId = null;
+    this.uncommittedOnly = false;
+    this.commitLoading = false;
+    this.closed = false;
+    this.open = null;
+    this.diffScroll = 0;
+    this.setLines([]);
+    this.applyActiveView(cx, this.context, { spawnLoad: true, forceLoad: true, resetHistory: true });
+    cx.notify();
+  }
+
+  toggleUncommittedOnly(cx) {
+    if (!this.commits.length || !this.workingFiles.length) return;
+    if (this.selectedCommitId) {
+      this.selectedCommitId = null;
+      this.uncommittedOnly = true;
+    } else {
+      this.uncommittedOnly = !this.uncommittedOnly;
+    }
+    this.commitLoading = false;
+    this.closed = false;
+    this.open = null;
+    this.diffScroll = 0;
+    this.setLines([]);
+    this.applyActiveView(cx, this.context, { spawnLoad: true, forceLoad: true, resetHistory: true });
+    cx.notify();
+  }
+
+  selectCommit(commitId, cx) {
+    const commit = this.commits.find(c => c.id === commitId);
+    if (!commit) return;
+    if (this.selectedCommitId === commitId && !this.commitLoading) {
+      cx.notify();
+      return;
+    }
+    this.selectedCommitId = commitId;
+    this.uncommittedOnly = false;
+    this.closed = false;
+    this.open = null;
+    this.diffScroll = 0;
+    this.setLines([]);
+    this.note = null;
+
+    if (this.commitFileCache.has(commitId)) {
+      this.commitLoading = false;
+      this.applyActiveView(cx, this.context, { spawnLoad: true, forceLoad: true, resetHistory: true });
+      cx.notify();
+      return;
+    }
+
+    const context = this.context;
+    const on = this.on;
+    this.commitLoading = true;
+    this.files = [];
+    this.groups = [];
+    cx.notify();
+
+    cx.spawn(async cx => {
+      try {
+        const res = await inspectCommitFiles(commit.repoRoot, commit.repoRel, commit.hash, on);
+        if (!this.current(context)) return;
+        const group = {
+          repoRoot: commit.repoRoot,
+          repoRel: commit.repoRel,
+          branch: commit.shortHash,
+          hasHead: true,
+          files: res.files,
+          limited: res.limited,
+        };
+        this.commitFileCache.set(commitId, { files: res.files, group, limited: res.limited });
+        if (this.selectedCommitId === commitId) {
+          this.commitLoading = false;
+          this.applyActiveView(cx, context, { spawnLoad: true, forceLoad: true, resetHistory: true });
+        }
+      } catch (e) {
+        if (this.current(context) && this.selectedCommitId === commitId) {
+          this.commitLoading = false;
+          this.note = `Failed to load commit changes: ${e}`;
+        }
+      }
+      cx.notify();
+    });
+  }
+
   selectFeature(relPath, cx, opts = null) {
     const nextFeature = relPath || null;
     const nextUserSpecified =
@@ -311,6 +511,7 @@ export default class IdeChanges extends View {
     this.singleBranch = null;
     this.activeRepoRoot = null;
     this.activeRepoRel = "";
+    this.resetBranchViewState();
     this.open = null;
     this.history = [];
     this.historyIdx = -1;
@@ -586,6 +787,7 @@ export default class IdeChanges extends View {
       this.singleBranch = null;
       this.activeRepoRoot = null;
       this.activeRepoRel = "";
+      this.resetBranchViewState();
       this.open = null;
       this.history = [];
       this.historyIdx = -1;
@@ -650,6 +852,7 @@ export default class IdeChanges extends View {
         this.selectedFeature = nextFeature;
         this.userSpecified = nextUserSpecified;
         if (featureChanged) {
+          this.resetBranchViewState();
           this.open = null;
           this.diffScroll = 0;
           this.setLines([]);
@@ -694,6 +897,7 @@ export default class IdeChanges extends View {
             this.groups = [];
             this.multiRepo = false;
             this.singleBranch = null;
+            this.resetBranchViewState();
             this.setLines([]);
             this.open = null;
             this.error = "Not a git repository";
@@ -704,44 +908,122 @@ export default class IdeChanges extends View {
 
         if (!this.current(context) || this.refreshSeq !== seq) return;
 
-        const activeGroups = multiRepo ? repoResults.filter(g => g.files.length > 0) : repoResults;
-        const files = activeGroups.flatMap(g => g.files);
-        const limited = activeGroups.some(g => g.limited);
+        // Inspect branch commits ahead of default branch for each repo
+        const branchInfos = await Promise.all(
+          repoResults.map(r =>
+            inspectRepoBranchCommits(r.repoRoot, r.repoRel, r.branch, r.hasHead, on).catch(() => ({
+              baseRef: null,
+              baseLabel: null,
+              mergeBase: null,
+              commits: [],
+            })),
+          ),
+        );
+        if (!this.current(context) || this.refreshSeq !== seq) return;
+
+        const allVsBaseResults = await Promise.all(
+          repoResults.map((r, idx) => {
+            const bi = branchInfos[idx];
+            if (!bi?.mergeBase || !bi.commits?.length) return Promise.resolve(null);
+            return inspectRepoAllVsBase(
+              r.repoRoot,
+              r.repoRel,
+              bi.mergeBase,
+              r.files,
+              r.hasHead,
+              on,
+            ).catch(() => null);
+          }),
+        );
+        if (!this.current(context) || this.refreshSeq !== seq) return;
+
+        const mergedCommits = branchInfos
+          .flatMap(bi => bi?.commits || [])
+          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        const detectedBaseLabel =
+          branchInfos.find(bi => bi?.commits?.length && bi?.baseLabel)?.baseLabel || "main";
+
+        const normalizedWorkingRepos = repoResults.map(r => ({
+          ...r,
+          files: r.files.map(f => ({ ...f, uncommitted: true, diffBase: null, source: "working" })),
+        }));
+        const workingGroups = multiRepo
+          ? normalizedWorkingRepos.filter(g => g.files.length > 0)
+          : normalizedWorkingRepos;
+        const workingFiles = workingGroups.flatMap(g => g.files);
+
+        const allBranchRepos = repoResults.map((r, idx) => {
+          const avb = allVsBaseResults[idx];
+          if (avb) {
+            return {
+              ...r,
+              files: avb.files,
+              limited: avb.limited,
+            };
+          }
+          return normalizedWorkingRepos[idx];
+        });
+        const allBranchGroups = multiRepo
+          ? allBranchRepos.filter(g => g.files.length > 0)
+          : allBranchRepos;
+        const allBranchFiles = allBranchGroups.flatMap(g => g.files);
 
         this.root = effectiveRoot;
         this.on = on;
         this.multiRepo = multiRepo;
         this.singleBranch = !multiRepo && repoResults[0]?.branch ? repoResults[0].branch : null;
-        this.groups = activeGroups;
-        this.files = files;
-        this.limited = limited;
+        this.commits = mergedCommits;
+        this.baseLabel = detectedBaseLabel;
+        this.workingGroups = workingGroups;
+        this.workingFiles = workingFiles;
+        this.allBranchGroups = allBranchGroups;
+        this.allBranchFiles = allBranchFiles;
         this.error = null;
         this.watch(baseRoot, cx);
 
-        if (this.open && !files.some(f => f.id === this.open)) {
-          this.open = null;
-          this.diffScroll = 0;
-          this.setLines([]);
-        }
-        if (!this.open && !this.closed && files.length) {
-          this.open = files[0].id;
-          this.diffScroll = 0;
-          if (!this.history.length) {
-            this.history = [this.open];
-            this.historyIdx = 0;
+        const validCommitIds = new Set(mergedCommits.map(c => c.id));
+        if (force) {
+          this.commitFileCache.clear();
+        } else {
+          for (const key of this.commitFileCache.keys()) {
+            if (!validCommitIds.has(key)) this.commitFileCache.delete(key);
           }
         }
-        const openFile = files.find(f => f.id === this.open) || files[0] || activeGroups[0];
-        if (openFile && files.length > 0) {
-          this.activeRepoRoot = openFile.repoRoot;
-          this.activeRepoRel = openFile.repoRel || "";
-        } else if (!multiRepo && repoResults[0]) {
-          this.activeRepoRoot = repoResults[0].repoRoot;
-          this.activeRepoRel = "";
-        } else {
-          this.activeRepoRoot = null;
-          this.activeRepoRel = "";
+        if (this.selectedCommitId && !validCommitIds.has(this.selectedCommitId)) {
+          this.selectedCommitId = null;
         }
+        if (this.uncommittedOnly && (mergedCommits.length === 0 || workingFiles.length === 0)) {
+          this.uncommittedOnly = false;
+        }
+
+        const activeCommit = this.selectedCommit();
+        if (activeCommit && !this.commitFileCache.has(activeCommit.id)) {
+          try {
+            const res = await inspectCommitFiles(
+              activeCommit.repoRoot,
+              activeCommit.repoRel,
+              activeCommit.hash,
+              on,
+            );
+            if (!this.current(context) || this.refreshSeq !== seq) return;
+            this.commitFileCache.set(activeCommit.id, {
+              files: res.files,
+              group: {
+                repoRoot: activeCommit.repoRoot,
+                repoRel: activeCommit.repoRel,
+                branch: activeCommit.shortHash,
+                hasHead: true,
+                files: res.files,
+                limited: res.limited,
+              },
+              limited: res.limited,
+            });
+          } catch {
+            this.selectedCommitId = null;
+          }
+        }
+
+        this.applyActiveView(cx, context);
 
         if (this.open) {
           try {
@@ -775,7 +1057,31 @@ export default class IdeChanges extends View {
     const root = file.repoRoot;
     const path = file.path;
     let lines;
-    if (file.fresh || (!file.hasHead && file.status === "A")) {
+    if (file.commitHash) {
+      const r = await exec(
+        "git",
+        [
+          ...READ,
+          "show",
+          "--format=",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-color",
+          "--root",
+          file.commitHash,
+          "--",
+          path,
+        ],
+        { cwd: root, on },
+      );
+      if (r.code !== 0) throw new Error(r.stderr);
+      const all = r.stdout.replace(/\n$/, "").split("\n");
+      const first = all.findIndex(l => l.startsWith("@@"));
+      lines =
+        first < 0
+          ? [file.binary ? "Binary file changed" : "No text diff available"]
+          : all.slice(first);
+    } else if (file.fresh || (!file.hasHead && file.status === "A")) {
       const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
       if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
       else if (text.includes("\0")) lines = ["Binary file · no text diff"];
@@ -792,12 +1098,17 @@ export default class IdeChanges extends View {
         ];
       }
     } else {
+      const baseArgs = file.diffBase
+        ? [file.diffBase]
+        : file.hasHead
+          ? ["HEAD"]
+          : [];
       const r = await exec(
         "git",
         [
           ...READ,
           "diff",
-          ...(file.hasHead ? ["HEAD"] : []),
+          ...baseArgs,
           "--no-ext-diff",
           "--no-textconv",
           "--no-color",
@@ -1243,7 +1554,90 @@ export default class IdeChanges extends View {
       .child(div().flex_1().min_w(0).truncate().child(text));
   }
 
+  renderCommitContextBanner(t) {
+    const commit = this.selectedCommit();
+    if (!commit) return null;
+    const rel = commit.relTime || compactRelTime(commit.timestamp);
+
+    return h_flex()
+      .id("changes-commit-banner")
+      .h(28)
+      .flex_none()
+      .px(10)
+      .gap(6)
+      .items_center()
+      .bg(t.raised)
+      .border_b(1)
+      .border_color(t.border)
+      .text_size(11.5)
+      .child(
+        div()
+          .id("changes-commit-banner-sha")
+          .flex_none()
+          .px(4)
+          .py(0.5)
+          .rounded(4)
+          .bg(t.selected)
+          .font_family(settings().font_family ?? "JetBrains Mono")
+          .text_size(10.5)
+          .text_color(t.accent)
+          .cursor_pointer()
+          .tooltip(`Copy full SHA: ${commit.hash}`)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            cx.write_to_clipboard(commit.hash);
+            notify({ title: "Copied", body: commit.shortHash, timeout: 1500 });
+          })
+          .child(commit.shortHash),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_color(t.foreground)
+          .child(commit.subject || "(no commit message)"),
+      )
+      .when(Boolean(this.multiRepo && commit.repoRel), el =>
+        el.child(
+          div()
+            .flex_none()
+            .px(4)
+            .rounded(3)
+            .border_1()
+            .border_color(t.border)
+            .text_size(10)
+            .text_color(t.dim)
+            .child(commit.repoRel),
+        ),
+      )
+      .when(Boolean(rel), el =>
+        el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(rel)),
+      )
+      .child(
+        div()
+          .id("changes-commit-banner-back")
+          .flex_none()
+          .px(6)
+          .py(1)
+          .rounded(4)
+          .border_1()
+          .border_color(t.border)
+          .text_size(10.5)
+          .text_color(t.muted)
+          .cursor_pointer()
+          .hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(`Back to All vs ${this.baseLabel}`)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            this.selectAllVsBase(cx);
+          })
+          .child(`All vs ${this.baseLabel} ↩`),
+      );
+  }
+
   renderDiffMainPane(t) {
+    const commitBanner = this.renderCommitContextBanner(t);
     const totalRows = this.rows.length;
     const viewH = Math.max(120, this.diffViewHeight || 480);
     const maxScroll = Math.max(0, totalRows * DIFF_LINE_H - viewH + 8);
@@ -1278,6 +1672,7 @@ export default class IdeChanges extends View {
       .min_w(0)
       .h_full()
       .min_h(0)
+      .when(Boolean(commitBanner), el => el.child(commitBanner))
       .child(
         div()
           .id("changes-diff-scroll")
@@ -1363,10 +1758,12 @@ export default class IdeChanges extends View {
                 .child(
                   this.note ||
                     this.error ||
-                    (this.loading
+                    (this.loading || this.commitLoading
                       ? "Loading diff…"
                       : !this.files.length
-                        ? "No uncommitted changes"
+                        ? this.selectedCommitId
+                          ? "No file changes in this commit"
+                          : "No uncommitted changes"
                         : "Select a changed file on the right to view its diff"),
                 ),
             ),
@@ -1393,7 +1790,10 @@ export default class IdeChanges extends View {
   }
 
   renderTreeFolderRow(sub, depth, open, t) {
-    const labelColor = sub.mark ? (GIT_COLOR[sub.mark] ?? t.foreground) : t.foreground;
+    const mergedView = this.isBranchMergedView();
+    const showVibrant = !mergedView || sub.hasUncommitted;
+    const labelColor =
+      showVibrant && sub.mark ? (GIT_COLOR[sub.mark] ?? t.foreground) : t.foreground;
     return h_flex()
       .id(`change-dir-${sub.key}`)
       .h(24)
@@ -1430,7 +1830,7 @@ export default class IdeChanges extends View {
           ),
       )
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(labelColor).child(sub.name))
-      .when(Boolean(sub.mark), el =>
+      .when(Boolean(sub.mark && showVibrant), el =>
         el.child(
           div()
             .flex_none()
@@ -1445,7 +1845,11 @@ export default class IdeChanges extends View {
   renderTreeFileRow(f, depth, t) {
     const isSelected = this.open === f.id;
     const fileIcon = getFileIcon(f.name);
-    const labelColor = GIT_COLOR[f.status] ?? t.foreground;
+    const mergedView = this.isBranchMergedView();
+    const isUncommittedInMerged = mergedView && Boolean(f.uncommitted);
+    const isCommittedOnlyInMerged = mergedView && !f.uncommitted;
+    const statusColor = GIT_COLOR[f.status] ?? t.foreground;
+    const labelColor = isCommittedOnlyInMerged ? t.foreground : statusColor;
     const relPath = f.repoRel ? `${f.repoRel}/${f.path}` : f.path;
 
     return h_flex()
@@ -1460,6 +1864,7 @@ export default class IdeChanges extends View {
       .cursor_pointer()
       .when(isSelected, e => e.bg(t.selected))
       .when(!isSelected, e => e.hover(s => s.bg(t.hover)))
+      .when(isUncommittedInMerged, e => e.tooltip("Uncommitted changes"))
       .on_mouse_down("left", (e, cx) => {
         cx.stop_propagation();
         this.contextMenu = null;
@@ -1510,8 +1915,19 @@ export default class IdeChanges extends View {
           .ml(5)
           .text_size(11)
           .font_semibold()
-          .text_color(labelColor)
+          .text_color(statusColor)
+          .when(isCommittedOnlyInMerged, el => el.opacity(0.68))
           .child(f.status),
+      )
+      .when(isUncommittedInMerged, e =>
+        e.child(
+          div()
+            .flex_none()
+            .ml(4)
+            .size(4.5)
+            .rounded(3)
+            .bg(GIT_DOT_COLOR[f.status] ?? t.accent),
+        ),
       );
   }
 
@@ -1735,6 +2151,215 @@ export default class IdeChanges extends View {
       );
   }
 
+  renderCommitsSection(t) {
+    if (!this.commits.length) return null;
+    const isAllActive = !this.selectedCommitId && !this.uncommittedOnly;
+    const uncommittedCount = this.workingFiles.length;
+    const allCount = this.allBranchFiles.length;
+    const folded = this.commitsSectionFolded;
+
+    return v_flex()
+      .id("changes-commits-section")
+      .flex_none()
+      .border_b(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .id("changes-commits-header")
+          .h(24)
+          .flex_none()
+          .px(8)
+          .gap(5)
+          .items_center()
+          .cursor_pointer()
+          .hover(s => s.bg(t.hover))
+          .on_click((_e, cx) => {
+            this.commitsSectionFolded = !this.commitsSectionFolded;
+            cx.notify();
+          })
+          .child(
+            svg(`${ICON_PREFIX}/codicon-chevron-${folded ? "right" : "down"}.svg`)
+              .size(12)
+              .flex_none()
+              .text_color(t.muted),
+          )
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11)
+              .font_medium()
+              .text_color(t.muted)
+              .child(`vs ${this.baseLabel}`),
+          )
+          .child(
+            div()
+              .flex_none()
+              .px(4)
+              .rounded(3)
+              .bg(t.raised)
+              .border_1()
+              .border_color(t.border)
+              .text_size(10)
+              .text_color(t.dim)
+              .child(String(this.commits.length)),
+          ),
+      )
+      .when(!folded, sec =>
+        sec.child(
+          v_flex()
+            .id("changes-commits-list")
+            .max_h(168)
+            .overflow_y_scrollbar()
+            .py(3)
+            .gap(1)
+            .child(
+              h_flex()
+                .id("changes-scope-all")
+                .h(24)
+                .flex_none()
+                .mx(4)
+                .px(6)
+                .gap(6)
+                .rounded(5)
+                .items_center()
+                .cursor_pointer()
+                .when(isAllActive, el => el.bg(t.selected))
+                .when(!isAllActive, el => el.hover(s => s.bg(t.hover)))
+                .on_click((_e, cx) => {
+                  this.contextMenu = null;
+                  this.selectAllVsBase(cx);
+                })
+                .child(
+                  div()
+                    .flex_none()
+                    .size(6)
+                    .rounded(3)
+                    .when(isAllActive, el => el.bg(t.accent))
+                    .when(!isAllActive, el => el.border_1().border_color(t.dim)),
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(11.5)
+                    .font_medium()
+                    .text_color(isAllActive ? t.accent : t.foreground)
+                    .child(`All vs ${this.baseLabel}`),
+                )
+                .when(uncommittedCount > 0, el =>
+                  el.child(
+                    h_flex()
+                      .id("changes-uncommitted-toggle")
+                      .flex_none()
+                      .h(16)
+                      .px(4)
+                      .gap(3)
+                      .rounded(3)
+                      .items_center()
+                      .cursor_pointer()
+                      .border_1()
+                      .border_color(this.uncommittedOnly ? t.accent : t.border)
+                      .bg(this.uncommittedOnly ? t.selected : t.raised)
+                      .hover(s => s.bg(this.uncommittedOnly ? t.selected : t.hover))
+                      .tooltip(
+                        this.uncommittedOnly
+                          ? "Showing uncommitted only (click for All)"
+                          : `${uncommittedCount} uncommitted files (click to filter)`,
+                      )
+                      .on_click((_e, cx) => {
+                        cx.stop_propagation();
+                        this.contextMenu = null;
+                        this.toggleUncommittedOnly(cx);
+                      })
+                      .child(
+                        div()
+                          .flex_none()
+                          .size(4.5)
+                          .rounded(3)
+                          .bg(this.uncommittedOnly ? t.accent : GIT_DOT_COLOR.M),
+                      )
+                      .child(
+                        div()
+                          .text_size(10)
+                          .text_color(this.uncommittedOnly ? t.accent : t.muted)
+                          .child(String(uncommittedCount)),
+                      ),
+                  ),
+                )
+                .child(
+                  div()
+                    .flex_none()
+                    .text_size(10)
+                    .text_color(t.dim)
+                    .child(String(allCount)),
+                ),
+            )
+            .child(div().mx(8).my(2).h(1).bg(t.border).opacity(0.6))
+            .children(
+              this.commits.map(c => {
+                const isSelected = this.selectedCommitId === c.id;
+                const rel = compactRelTime(c.timestamp);
+                const metaParts = [c.shortHash];
+                if (this.multiRepo && c.repoRel) metaParts.push(c.repoRel);
+                if (rel) metaParts.push(rel);
+                if (c.filesChanged > 0) metaParts.push(`${c.filesChanged}f`);
+
+                return v_flex()
+                  .id(`changes-commit-${c.id}`)
+                  .flex_none()
+                  .mx(4)
+                  .px(6)
+                  .py(3)
+                  .gap(1)
+                  .rounded(5)
+                  .cursor_pointer()
+                  .when(isSelected, el => el.bg(t.selected))
+                  .when(!isSelected, el => el.hover(s => s.bg(t.hover)))
+                  .tooltip(`${c.shortHash} · ${c.subject}${c.author ? ` (${c.author})` : ""}`)
+                  .on_click((_e, cx) => {
+                    this.contextMenu = null;
+                    this.selectCommit(c.id, cx);
+                  })
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .flex_none()
+                          .size(5.5)
+                          .rounded(3)
+                          .when(isSelected, el => el.bg(t.accent))
+                          .when(!isSelected, el => el.border_1().border_color(t.dim).opacity(0.75)),
+                      )
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .truncate()
+                          .text_size(11.5)
+                          .when(isSelected, el => el.font_medium().text_color(t.accent))
+                          .when(!isSelected, el => el.text_color(t.foreground))
+                          .child(c.subject || "(no commit message)"),
+                      ),
+                  )
+                  .child(
+                    div()
+                      .pl(11.5)
+                      .truncate()
+                      .text_size(10)
+                      .text_color(t.dim)
+                      .child(metaParts.join(" · ")),
+                  );
+              }),
+            ),
+        ),
+      );
+  }
+
   renderChangesSidebar(t) {
     const baseRootName = (this.baseRoot || this.root)?.split(/[\\/]/).pop() || "changes";
     const rootName = this.root?.split(/[\\/]/).pop() || "changes";
@@ -1743,6 +2368,9 @@ export default class IdeChanges extends View {
       : null;
     const hasFilter = Boolean(this.filterQuery.trim());
     const treeItems = this.renderTreeItems(t);
+    const commitsSection = this.renderCommitsSection(t);
+    const showCommitBox =
+      this.commits.length === 0 || (!this.selectedCommitId && this.workingFiles.length > 0);
     const targetRoot = this.activeRepoRoot || (!this.multiRepo ? this.root : null);
     const enabled = Boolean(this.message.trim() && targetRoot && !this.busy && !this.loading);
 
@@ -1948,6 +2576,8 @@ export default class IdeChanges extends View {
               ),
           ),
       )
+      // 2.5 Branch Commits vs Default Branch (only rendered when ahead of base branch)
+      .when(Boolean(commitsSection), el => el.child(commitsSection))
       // 3. Hierarchical Changes File Tree grouped by Repository
       .child(
         v_flex()
@@ -1965,11 +2595,13 @@ export default class IdeChanges extends View {
                 .text_color(t.dim)
                 .child(
                   this.error ||
-                    (this.loading
+                    (this.loading || this.commitLoading
                       ? "Loading changes…"
-                      : this.root
-                        ? "No uncommitted changes"
-                        : "No folder"),
+                      : this.selectedCommitId
+                        ? "No file changes in this commit"
+                        : this.root
+                          ? "No uncommitted changes"
+                          : "No folder"),
                 ),
             ),
           )
@@ -1992,64 +2624,70 @@ export default class IdeChanges extends View {
             ),
           ),
       )
-      // 4. Commit Box at the bottom of the sidebar
-      .child(
-        v_flex()
-          .flex_none()
-          .p(6)
-          .gap(5)
-          .border_t(1)
-          .border_color(t.border)
-          .when(Boolean(this.multiRepo && this.activeRepoRel), el =>
-            el.child(
-              h_flex()
-                .gap(4)
-                .px(2)
-                .items_center()
-                .text_size(10.5)
-                .text_color(t.dim)
-                .child(div().child("Target:"))
-                .child(div().font_medium().text_color(t.muted).truncate().child(this.activeRepoRel)),
-            ),
-          )
-          .child(
-            h_flex()
-              .gap(5)
-              .items_center()
-              .child(
-                div()
-                  .id("commit-message")
-                  .flex_1()
-                  .min_w(0)
-                  .h(26)
-                  .px(8)
-                  .flex()
+      // 4. Commit Box at the bottom of the sidebar (hidden when viewing a commit or when clean on branch)
+      .when(showCommitBox, sidebar =>
+        sidebar.child(
+          v_flex()
+            .flex_none()
+            .p(6)
+            .gap(5)
+            .border_t(1)
+            .border_color(t.border)
+            .when(Boolean(this.multiRepo && this.activeRepoRel), el =>
+              el.child(
+                h_flex()
+                  .gap(4)
+                  .px(2)
                   .items_center()
-                  .rounded(5)
-                  .bg(t.raised)
-                  .border_1()
-                  .border_color(this.typing ? t.accent : t.border)
-                  .cursor_text()
-                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                  .child(Input.new(this.input).h_full().text_size(11.5).text_color(t.foreground)),
-              )
-              .child(
-                div()
-                  .id("commit")
-                  .h(26)
-                  .px(10)
-                  .flex_none()
-                  .flex()
-                  .items_center()
-                  .rounded(5)
-                  .bg(enabled ? t.solid : t.raised)
-                  .text_color(enabled ? t.solid_foreground : t.dim)
-                  .text_size(11.5)
-                  .when(enabled, e => e.cursor_pointer())
-                  .on_click((_e, cx) => this.commit(cx))
-                  .child(this.busy ? "…" : "Commit"),
+                  .text_size(10.5)
+                  .text_color(t.dim)
+                  .child(div().child("Target:"))
+                  .child(
+                    div().font_medium().text_color(t.muted).truncate().child(this.activeRepoRel),
+                  ),
               ),
-          ),
+            )
+            .child(
+              h_flex()
+                .gap(5)
+                .items_center()
+                .child(
+                  div()
+                    .id("commit-message")
+                    .flex_1()
+                    .min_w(0)
+                    .h(26)
+                    .px(8)
+                    .flex()
+                    .items_center()
+                    .rounded(5)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(this.typing ? t.accent : t.border)
+                    .cursor_text()
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .child(
+                      Input.new(this.input).h_full().text_size(11.5).text_color(t.foreground),
+                    ),
+                )
+                .child(
+                  div()
+                    .id("commit")
+                    .h(26)
+                    .px(10)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .rounded(5)
+                    .bg(enabled ? t.solid : t.raised)
+                    .text_color(enabled ? t.solid_foreground : t.dim)
+                    .text_size(11.5)
+                    .when(enabled, e => e.cursor_pointer())
+                    .on_click((_e, cx) => this.commit(cx))
+                    .child(this.busy ? "…" : "Commit"),
+                ),
+            ),
+        ),
       )
       .when(this.hasWorktreeDir && this.wtDropdownOpen, el =>
         el.child(this.renderWorktreeDropdownMenu(t, baseRootName)),
